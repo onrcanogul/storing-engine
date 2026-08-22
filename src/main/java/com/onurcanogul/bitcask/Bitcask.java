@@ -147,6 +147,45 @@ public final class Bitcask implements AutoCloseable {
     }
 
     /**
+     * Removes {@code key}, if it is present.
+     *
+     * <p>Deletion is a write. In an append-only log nothing can be erased, so a
+     * tombstone record is appended to cancel the earlier PUT during replay.
+     * Dropping the index entry alone would not survive a restart: the replay
+     * would find the old PUT and resurrect the deleted value.
+     *
+     * @return true if the key was present and is now gone
+     */
+    public synchronized boolean delete(byte[] key) throws IOException {
+        ensureOpen();
+        validateKey(key);
+
+        ByteBuffer lookupKey = ByteBuffer.wrap(key);
+        if (!keyDir.containsKey(lookupKey)) {
+            // Nothing to cancel, so a tombstone here would be pure garbage.
+            return false;
+        }
+
+        long seq = nextSeq;
+        ByteBuffer record = RecordCodec.encode(
+                seq, System.currentTimeMillis(), RecordType.TOMBSTONE, key, new byte[0]);
+        int size = record.remaining();
+        long position = writePos;
+
+        writeFully(record, position);
+        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
+            channel.force(false);
+        }
+
+        // Disk before memory, exactly as in put.
+        keyDir.remove(lookupKey);
+
+        writePos = position + size;
+        nextSeq = seq + 1;
+        return true;
+    }
+
+    /**
      * Returns the value stored under {@code key}, or {@code null} if there is none.
      *
      * <p>Takes no lock: the index lookup is lock-free and the disk read is
