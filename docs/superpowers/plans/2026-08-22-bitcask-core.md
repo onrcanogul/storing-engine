@@ -29,27 +29,58 @@
 
 ## File Structure
 
-**Main (`src/main/java/com/onurcanogul/bitcask/`):**
+Packages are split by responsibility, not by layer: what the bytes look like on
+disk, what lives in memory, what happens at startup, who owns the files.
+
+**`com.onurcanogul.bitcask`** — the public API surface:
 
 | File | Responsibility |
 |---|---|
-| `Bitcask.java` | Public API: `open`, `put`, `get`, `delete`, `close` |
+| `Bitcask.java` | `open`, `put`, `get`, `delete`, `close` |
 | `BitcaskConfig.java` | Configuration record + defaults |
 | `SyncPolicy.java` | enum `NEVER`, `ALWAYS` |
 | `RecoveryMode.java` | enum `TOLERATE_TAIL`, `STRICT` |
-| `RecordType.java` | enum `PUT(1)`, `TOMBSTONE(2)` |
-| `LogRecord.java` | Parsed record value object |
-| `RecordCodec.java` | Encode/decode records, CRC, size limits |
-| `FileHeader.java` | 8-byte file header: write + validate |
-| `KeyDirEntry.java` | KeyDir value: fileId, recordPos, recordSize, seq |
-| `Recovery.java` | Log replay, validation chain, corruption policy |
-| `RecoveryReport.java` | What recovery found (user-facing) |
-| `RecoveryResult.java` | Internal: report + endOffset + maxSeq |
+| `RecoveryReport.java` | What recovery found (returned to the caller) |
 | `StopReason.java` | enum: why the scan stopped |
-| `DirectoryLock.java` | Single-writer enforcement (file lock + in-JVM guard) |
-| `CorruptRecordException.java` | Thrown when a record fails validation |
 
-**Test (`src/test/java/com/onurcanogul/bitcask/`):** one test class per main class, plus `ModelBasedTest.java` and `CrashTest.java` + `CrashWriterMain.java`.
+**`...bitcask.format`** — how bytes look on disk:
+
+| File | Responsibility |
+|---|---|
+| `FormatLimits.java` | `MAX_KEY_SIZE`, `HARD_MAX_VALUE_SIZE` — constants, never configuration |
+| `RecordType.java` | enum `PUT(1)`, `TOMBSTONE(2)` |
+| `LogRecord.java` | Decoded record value object |
+| `RecordCodec.java` | Encode/decode records, CRC32C, header validation |
+| `FileHeader.java` | 8-byte file header: write + validate |
+| `CorruptRecordException.java` | Thrown when bytes cannot be trusted |
+
+**`...bitcask.index`** — what lives in memory:
+
+| File | Responsibility |
+|---|---|
+| `KeyDirEntry.java` | fileId, recordPos, recordSize, seq |
+
+**`...bitcask.recovery`** — rebuilding state at startup:
+
+| File | Responsibility |
+|---|---|
+| `Recovery.java` | Log replay, validation chain, corruption policy |
+| `RecoveryResult.java` | Internal: report + endOffset + maxSeq |
+
+**`...bitcask.store`** — file and channel ownership:
+
+| File | Responsibility |
+|---|---|
+| `DirectoryLock.java` | Single-writer enforcement (file lock + in-JVM guard) |
+
+**Dependency direction is one-way:** the root package depends on `format`,
+`index`, `recovery` and `store`; none of them depend back on the root. This is
+why `HARD_MAX_VALUE_SIZE` lives in `FormatLimits` rather than `BitcaskConfig` —
+`RecordCodec` needs it, and pointing the format package back at the config
+package would create a cycle.
+
+**Tests mirror the package structure**, plus `ModelBasedTest.java`,
+`CrashTest.java` and `CrashWriterMain.java` in the root test package.
 
 ---
 
@@ -316,15 +347,21 @@ git commit -m "feat: value types, enums and config with hard limits"
 
 This is the heart of the format. Everything else depends on it.
 
+Note: the code blocks below were written before the package split. Use the
+package declarations from the File Structure section — `RecordCodec`,
+`FileHeader` and the record types live in `com.onurcanogul.bitcask.format`,
+`DirectoryLock` in `...store`, `Recovery` and `RecoveryResult` in
+`...recovery`, and everything else in the root package.
+
 **Files:**
-- Create: `src/main/java/com/onurcanogul/bitcask/RecordCodec.java`
-- Test: `src/test/java/com/onurcanogul/bitcask/RecordCodecTest.java`
+- Create: `src/main/java/com/onurcanogul/bitcask/format/RecordCodec.java`
+- Test: `src/test/java/com/onurcanogul/bitcask/format/RecordCodecTest.java`
 
 **Interfaces:**
-- Consumes: `LogRecord`, `RecordType`, `CorruptRecordException`, `BitcaskConfig.HARD_MAX_VALUE_SIZE`
+- Consumes: `LogRecord`, `RecordType`, `CorruptRecordException`, `FormatLimits`
 - Produces:
   - `RecordCodec.HEADER_SIZE` = `27`
-  - `RecordCodec.MAX_KEY_SIZE` = `65535`
+  - key length bound comes from `FormatLimits.MAX_KEY_SIZE`
   - `static ByteBuffer encode(long seq, long tstamp, RecordType type, byte[] key, byte[] value)`
   - `static int recordSize(int keyLen, int valLen)`
   - `static LogRecord decode(ByteBuffer record) throws CorruptRecordException` — buffer must contain exactly one full record starting at position 0
@@ -477,7 +514,6 @@ import java.util.zip.CRC32C;
 public final class RecordCodec {
 
     public static final int HEADER_SIZE = 27;
-    public static final int MAX_KEY_SIZE = 65_535;
 
     private static final int OFF_CRC     = 0;
     private static final int OFF_SEQ     = 4;
@@ -537,7 +573,7 @@ public final class RecordCodec {
             throw new CorruptRecordException("invalid keyLen: " + keyLen);
         }
         RecordType.fromCode(typeCode); // throws on unknown type
-        if (valLen < 0 || valLen > BitcaskConfig.HARD_MAX_VALUE_SIZE) {
+        if (valLen < 0 || valLen > FormatLimits.HARD_MAX_VALUE_SIZE) {
             throw new CorruptRecordException("invalid valLen: " + valLen);
         }
         long total = (long) HEADER_SIZE + keyLen + valLen;
@@ -605,8 +641,8 @@ git commit -m "feat: record codec with crc32c over all length fields"
 ## Task 4: File Header
 
 **Files:**
-- Create: `src/main/java/com/onurcanogul/bitcask/FileHeader.java`
-- Test: `src/test/java/com/onurcanogul/bitcask/FileHeaderTest.java`
+- Create: `src/main/java/com/onurcanogul/bitcask/format/FileHeader.java`
+- Test: `src/test/java/com/onurcanogul/bitcask/format/FileHeaderTest.java`
 
 **Interfaces:**
 - Consumes: `CorruptRecordException`
@@ -756,8 +792,8 @@ git commit -m "feat: file header with magic and format version"
 ## Task 5: Directory Lock (single-writer enforcement)
 
 **Files:**
-- Create: `src/main/java/com/onurcanogul/bitcask/DirectoryLock.java`
-- Test: `src/test/java/com/onurcanogul/bitcask/DirectoryLockTest.java`
+- Create: `src/main/java/com/onurcanogul/bitcask/store/DirectoryLock.java`
+- Test: `src/test/java/com/onurcanogul/bitcask/store/DirectoryLockTest.java`
 
 **Interfaces:**
 - Consumes: nothing
@@ -1289,9 +1325,9 @@ Add these members; `put` is `synchronized` because the spec allows exactly one w
         if (key == null || key.length == 0) {
             throw new IllegalArgumentException("key must not be empty");
         }
-        if (key.length > RecordCodec.MAX_KEY_SIZE) {
+        if (key.length > FormatLimits.MAX_KEY_SIZE) {
             throw new IllegalArgumentException(
-                "key too long: " + key.length + " > " + RecordCodec.MAX_KEY_SIZE);
+                "key too long: " + key.length + " > " + FormatLimits.MAX_KEY_SIZE);
         }
     }
 ```
@@ -1605,10 +1641,10 @@ git commit -m "feat: delete via tombstone records"
 ## Task 10: Recovery (log replay)
 
 **Files:**
-- Create: `src/main/java/com/onurcanogul/bitcask/RecoveryResult.java`
-- Create: `src/main/java/com/onurcanogul/bitcask/Recovery.java`
+- Create: `src/main/java/com/onurcanogul/bitcask/recovery/RecoveryResult.java`
+- Create: `src/main/java/com/onurcanogul/bitcask/recovery/Recovery.java`
 - Modify: `src/main/java/com/onurcanogul/bitcask/Bitcask.java` (call real recovery in `open`)
-- Test: `src/test/java/com/onurcanogul/bitcask/RecoveryTest.java`
+- Test: `src/test/java/com/onurcanogul/bitcask/recovery/RecoveryTest.java`
 
 **Interfaces:**
 - Consumes: `RecordCodec`, `FileHeader`, `KeyDirEntry`, `RecoveryMode`, `StopReason`, `RecoveryReport`
