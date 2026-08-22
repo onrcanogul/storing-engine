@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.store.SegmentFiles;
 import com.onurcanogul.bitcask.recovery.StopReason;
 import com.onurcanogul.bitcask.recovery.RecoveryReport;
 import org.junit.jupiter.api.Test;
@@ -23,7 +24,7 @@ class BitcaskLifecycleTest {
     void opensAnEmptyDirectoryAndCreatesTheLog() throws Exception {
         try (Bitcask db = Bitcask.open(dir, BitcaskConfig.defaults())) {
             assertEquals(0, db.size());
-            assertTrue(Files.exists(dir.resolve("data.log")));
+            assertTrue(Files.exists(SegmentFiles.pathOf(dir, 1)));
 
             RecoveryReport report = db.recoveryReport();
             assertEquals(0, report.recordsReplayed());
@@ -36,7 +37,7 @@ class BitcaskLifecycleTest {
     @Test
     void freshLogStartsWithJustTheFileHeader() throws Exception {
         try (Bitcask db = Bitcask.open(dir, BitcaskConfig.defaults())) {
-            assertEquals(8, Files.size(dir.resolve("data.log")));
+            assertEquals(8, Files.size(SegmentFiles.pathOf(dir, 1)));
         }
     }
 
@@ -77,13 +78,13 @@ class BitcaskLifecycleTest {
     }
 
     @Test
-    void openFailsOnAForeignFileAndReleasesTheLock() throws Exception {
-        Files.write(dir.resolve("data.log"), "this is not a bitcask log".getBytes());
+    void openFailsOnAForeignSegmentAndReleasesTheLock() throws Exception {
+        Files.write(SegmentFiles.pathOf(dir, 1), "this is not a bitcask segment".getBytes());
 
         assertThrows(IOException.class, () -> Bitcask.open(dir, BitcaskConfig.defaults()));
 
         // The failed open must not have left the directory locked.
-        Files.delete(dir.resolve("data.log"));
+        Files.delete(SegmentFiles.pathOf(dir, 1));
         Bitcask.open(dir, BitcaskConfig.defaults()).close();
     }
 }

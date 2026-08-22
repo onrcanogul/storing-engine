@@ -1,7 +1,6 @@
 package com.onurcanogul.bitcask;
 
 import com.onurcanogul.bitcask.format.FileHeader;
-import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.recovery.RecoveryMode;
 
@@ -26,10 +25,10 @@ public record BitcaskConfig(int maxValueSize,
         if (maxValueSize <= 0) {
             throw new IllegalArgumentException("maxValueSize must be positive: " + maxValueSize);
         }
-        if (maxValueSize > FormatLimits.HARD_MAX_VALUE_SIZE) {
+        if (maxValueSize > com.onurcanogul.bitcask.format.FormatLimits.HARD_MAX_VALUE_SIZE) {
             throw new IllegalArgumentException(
                     "maxValueSize " + maxValueSize + " exceeds HARD_MAX_VALUE_SIZE "
-                            + FormatLimits.HARD_MAX_VALUE_SIZE);
+                            + com.onurcanogul.bitcask.format.FormatLimits.HARD_MAX_VALUE_SIZE);
         }
         if (maxSegmentSize <= 0) {
             throw new IllegalArgumentException("maxSegmentSize must be positive: " + maxSegmentSize);
@@ -38,23 +37,29 @@ public record BitcaskConfig(int maxValueSize,
         int required = smallestUsableSegmentSize(maxValueSize);
         if (maxSegmentSize < required) {
             throw new IllegalArgumentException(
-                    "maxSegmentSize " + maxSegmentSize + " cannot hold the largest possible record; "
+                    "maxSegmentSize " + maxSegmentSize + " cannot hold even a minimal record; "
                             + "at least " + required + " is required for maxValueSize " + maxValueSize);
         }
     }
 
     /**
-     * The smallest segment that can still hold one record of the largest
-     * permitted shape.
+     * The smallest segment that could hold any record at all: one with a
+     * single-byte key and a value at the configured limit.
      *
-     * <p>A record is never split across segments, so one that fits nowhere would
-     * make rotation loop forever: rotate, still does not fit, rotate again. This
-     * bound turns that into a configuration error at construction time.
+     * <p>This deliberately assumes the <em>smallest</em> possible key rather than
+     * the largest. Configuration cannot know how large keys will actually be, and
+     * assuming the 64 KB ceiling would force every store to use 65 KB segments no
+     * matter what it stores.
+     *
+     * <p>The real question — does <em>this</em> record fit anywhere — is answered
+     * at write time, where the actual size is known. A record is never split
+     * across segments, so one that fits nowhere is rejected outright instead of
+     * sending rotation into a loop.
      */
     public static int smallestUsableSegmentSize(int maxValueSize) {
         return FileHeader.SIZE
                 + RecordCodec.HEADER_SIZE
-                + FormatLimits.MAX_KEY_SIZE
+                + 1
                 + maxValueSize;
     }
 

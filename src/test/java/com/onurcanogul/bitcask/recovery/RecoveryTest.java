@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask.recovery;
 
+import com.onurcanogul.bitcask.store.SegmentFiles;
 import com.onurcanogul.bitcask.Bitcask;
 import com.onurcanogul.bitcask.BitcaskConfig;
 import com.onurcanogul.bitcask.SyncPolicy;
@@ -32,7 +33,7 @@ class RecoveryTest {
     }
 
     private Path log() {
-        return dir.resolve("data.log");
+        return SegmentFiles.pathOf(dir, 1);
     }
 
     private BitcaskConfig strict() {

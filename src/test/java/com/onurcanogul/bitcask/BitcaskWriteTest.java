@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.store.SegmentFiles;
 import com.onurcanogul.bitcask.recovery.RecoveryMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -21,7 +22,7 @@ class BitcaskWriteTest {
     }
 
     private long logSize() throws Exception {
-        return Files.size(dir.resolve("data.log"));
+        return Files.size(SegmentFiles.pathOf(dir, 1));
     }
 
     @Test

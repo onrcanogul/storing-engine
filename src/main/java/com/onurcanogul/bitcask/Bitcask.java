@@ -1,16 +1,16 @@
 package com.onurcanogul.bitcask;
 
-import com.onurcanogul.bitcask.recovery.RecoveryReport;
-import com.onurcanogul.bitcask.recovery.RecoveryResult;
-import com.onurcanogul.bitcask.recovery.Recovery;
-import com.onurcanogul.bitcask.recovery.RecoveryMode;
 import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.LogRecord;
 import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
+import com.onurcanogul.bitcask.recovery.Recovery;
+import com.onurcanogul.bitcask.recovery.RecoveryReport;
+import com.onurcanogul.bitcask.recovery.RecoveryResult;
 import com.onurcanogul.bitcask.store.DirectoryLock;
+import com.onurcanogul.bitcask.store.SegmentFiles;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -18,17 +18,21 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * An append-only key-value store with an in-memory index.
  *
- * <p>Every write is appended to a single log file, and the index maps each live
- * key to the offset of its most recent record. A read is therefore always
- * exactly one positional read, whatever the size of the data. The price is that
- * every key must fit in memory.
+ * <p>Writes are appended to the active segment; when it reaches
+ * {@link BitcaskConfig#maxSegmentSize()} a new one is started and the previous
+ * becomes immutable. The index maps each live key to the segment and offset of
+ * its most recent record, so a read is always exactly one positional read
+ * whatever the size of the data. The price is that every key must fit in memory.
  *
  * <p>One writer, many readers: writes are serialized on this instance while
  * reads take no lock. One process per directory, enforced by
@@ -36,31 +40,39 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class Bitcask implements AutoCloseable {
 
-    public static final String DATA_FILE_NAME = "data.log";
-
+    private final Path directory;
     private final BitcaskConfig config;
     private final DirectoryLock lock;
-    private final FileChannel channel;
     private final Map<ByteBuffer, KeyDirEntry> keyDir;
     private final RecoveryReport report;
 
+    /** Every segment stays open: the index points into all of them. */
+    private final Map<Integer, FileChannel> channels;
+
+    private int activeFileId;
+    private FileChannel activeChannel;
     private long writePos;
     private long nextSeq;
 
     private volatile boolean closed;
 
-    private Bitcask(BitcaskConfig config,
+    private Bitcask(Path directory,
+                    BitcaskConfig config,
                     DirectoryLock lock,
-                    FileChannel channel,
+                    Map<Integer, FileChannel> channels,
                     Map<ByteBuffer, KeyDirEntry> keyDir,
                     RecoveryReport report,
+                    int activeFileId,
                     long writePos,
                     long nextSeq) {
+        this.directory = directory;
         this.config = config;
         this.lock = lock;
-        this.channel = channel;
+        this.channels = channels;
         this.keyDir = keyDir;
         this.report = report;
+        this.activeFileId = activeFileId;
+        this.activeChannel = channels.get(activeFileId);
         this.writePos = writePos;
         this.nextSeq = nextSeq;
     }
@@ -68,45 +80,66 @@ public final class Bitcask implements AutoCloseable {
     /**
      * Opens the store in {@code dir}, creating the directory if necessary.
      *
-     * @throws IOException if the directory is already open, or the log is not one
-     *                     of ours, or it is damaged and the configured
-     *                     {@link RecoveryMode} refuses to continue
+     * @throws IOException if the directory is already open, or a segment is not
+     *                     one of ours, or the log is damaged and the configured
+     *                     {@link com.onurcanogul.bitcask.recovery.RecoveryMode}
+     *                     refuses to continue
      */
     public static Bitcask open(Path dir, BitcaskConfig config) throws IOException {
         Files.createDirectories(dir);
         DirectoryLock lock = DirectoryLock.acquire(dir);
 
-        FileChannel channel = null;
+        Map<Integer, FileChannel> channels = new HashMap<>();
         try {
-            Path logFile = dir.resolve(DATA_FILE_NAME);
-            boolean fresh = !Files.exists(logFile) || Files.size(logFile) == 0;
+            SegmentFiles.adoptLegacyLog(dir);
 
-            channel = FileChannel.open(logFile,
-                    StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            List<Integer> fileIds = new ArrayList<>(SegmentFiles.listFileIds(dir));
+            if (fileIds.isEmpty()) {
+                fileIds.add(SegmentFiles.FIRST_FILE_ID);
+            }
 
-            if (fresh) {
-                FileHeader.write(channel);
-            } else {
-                FileHeader.validate(channel);
+            for (int fileId : fileIds) {
+                channels.put(fileId, openSegment(dir, fileId));
             }
 
             Map<ByteBuffer, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
-            RecoveryResult recovered = Recovery.replay(channel, keyDir, config.recoveryMode());
+            RecoveryResult recovered = Recovery.replay(channels, fileIds, keyDir, config.recoveryMode());
 
-            return new Bitcask(config, lock, channel, keyDir,
-                    recovered.report(), recovered.endOffset(), recovered.maxSeq() + 1);
+            return new Bitcask(dir, config, lock, channels, keyDir, recovered.report(),
+                    recovered.activeFileId(), recovered.writePos(), recovered.maxSeq() + 1);
 
         } catch (IOException | RuntimeException e) {
             // A half-finished open must not leave the directory locked forever.
-            closeQuietly(channel);
+            channels.values().forEach(Bitcask::closeQuietly);
             releaseQuietly(lock, e);
             throw e;
         }
     }
 
-    /** What the last recovery found. Never null. */
-    public RecoveryReport recoveryReport() {
-        return report;
+    /**
+     * Opens one segment, writing its header if the file is new.
+     *
+     * <p>A file shorter than a header cannot hold a record, so it is repaired
+     * rather than rejected: that is exactly what a rotation interrupted between
+     * creating the file and writing its header leaves behind.
+     */
+    private static FileChannel openSegment(Path dir, int fileId) throws IOException {
+        Path path = SegmentFiles.pathOf(dir, fileId);
+
+        FileChannel channel = FileChannel.open(path,
+                StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        try {
+            if (channel.size() < FileHeader.SIZE) {
+                channel.truncate(0);
+                FileHeader.write(channel);
+            } else {
+                FileHeader.validate(channel);
+            }
+            return channel;
+        } catch (IOException | RuntimeException e) {
+            closeQuietly(channel);
+            throw e;
+        }
     }
 
     /**
@@ -129,24 +162,9 @@ public final class Bitcask implements AutoCloseable {
                     "value too large: " + storedValue.length + " > " + config.maxValueSize());
         }
 
-        long seq = nextSeq;
-        ByteBuffer record = RecordCodec.encode(
-                seq, System.currentTimeMillis(), RecordType.PUT, key, storedValue);
-        int size = record.remaining();
-        long position = writePos;
-
-        writeFully(record, position);
-        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            channel.force(false);
-        }
-
-        // Disk before memory. In the other order a failed write would leave the
-        // index pointing at a record that does not exist.
-        keyDir.put(indexKeyCopyOf(key), new KeyDirEntry(0, position, size, seq));
-
-        // Advanced last, so a failed write leaves no gap in the log.
-        writePos = position + size;
-        nextSeq = seq + 1;
+        append(RecordType.PUT, key, storedValue,
+                (position, size, seq) -> keyDir.put(indexKeyCopyOf(key),
+                        new KeyDirEntry(activeFileId, position, size, seq)));
     }
 
     /**
@@ -169,23 +187,77 @@ public final class Bitcask implements AutoCloseable {
             return false;
         }
 
+        append(RecordType.TOMBSTONE, key, new byte[0],
+                (position, size, seq) -> keyDir.remove(lookupKey));
+        return true;
+    }
+
+    /** What the index update should be, once the record is safely on its way to disk. */
+    @FunctionalInterface
+    private interface IndexUpdate {
+        void apply(long position, int size, long seq);
+    }
+
+    private void append(RecordType type, byte[] key, byte[] value, IndexUpdate indexUpdate)
+            throws IOException {
+        int size = RecordCodec.recordSize(key.length, value.length);
+
+        // Records are never split across segments, so one that cannot fit in an
+        // empty segment fits nowhere. Rotating would just produce a fresh segment
+        // it still does not fit in, and then another.
+        if (FileHeader.SIZE + size > config.maxSegmentSize()) {
+            throw new IllegalArgumentException(
+                    "record of " + size + " bytes cannot fit in any segment of "
+                            + config.maxSegmentSize() + " bytes"
+                            + " (key " + key.length + " B, value " + value.length + " B)");
+        }
+        if (writePos + size > config.maxSegmentSize()) {
+            rotate();
+        }
+
         long seq = nextSeq;
-        ByteBuffer record = RecordCodec.encode(
-                seq, System.currentTimeMillis(), RecordType.TOMBSTONE, key, new byte[0]);
-        int size = record.remaining();
+        ByteBuffer record = RecordCodec.encode(seq, System.currentTimeMillis(), type, key, value);
         long position = writePos;
 
         writeFully(record, position);
         if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            channel.force(false);
+            activeChannel.force(false);
         }
 
-        // Disk before memory, exactly as in put.
-        keyDir.remove(lookupKey);
+        // Disk before memory. In the other order a failed write would leave the
+        // index pointing at a record that does not exist.
+        indexUpdate.apply(position, size, seq);
 
+        // Advanced last, so a failed write leaves no gap in the log.
         writePos = position + size;
         nextSeq = seq + 1;
-        return true;
+    }
+
+    /**
+     * Closes the active segment to further writes and starts the next one.
+     *
+     * <p>The outgoing segment is fsynced regardless of {@link SyncPolicy}. It
+     * happens once per segment, so the cost is amortised to nothing, and it buys
+     * something the recovery logic depends on: a closed segment is known to have
+     * reached the disk, which is why damage found in one is treated as real
+     * corruption rather than as a torn tail.
+     *
+     * <p>The old channel stays open — the index still points into it.
+     */
+    private void rotate() throws IOException {
+        activeChannel.force(false);
+
+        int newFileId = activeFileId + 1;
+        // CREATE_NEW rather than CREATE: if that file somehow exists, something
+        // is badly wrong and overwriting it would destroy records.
+        FileChannel newChannel = FileChannel.open(SegmentFiles.pathOf(directory, newFileId),
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        FileHeader.write(newChannel);
+
+        channels.put(newFileId, newChannel);
+        activeFileId = newFileId;
+        activeChannel = newChannel;
+        writePos = FileHeader.SIZE;
     }
 
     /**
@@ -208,8 +280,14 @@ public final class Bitcask implements AutoCloseable {
             return null;
         }
 
+        FileChannel channel = channels.get(entry.fileId());
+        if (channel == null) {
+            throw new IOException("index points at segment " + entry.fileId()
+                    + ", which is not open: internal inconsistency");
+        }
+
         ByteBuffer buf = ByteBuffer.allocate(entry.recordSize());
-        readFully(buf, entry.recordPos());
+        readFully(channel, buf, entry.recordPos());
         buf.flip();
 
         LogRecord record = RecordCodec.decode(buf);
@@ -218,21 +296,32 @@ public final class Bitcask implements AutoCloseable {
         // right one. A wrong offset lands on a perfectly valid record belonging
         // to some other key, and only this comparison catches that.
         if (!Arrays.equals(record.key(), key)) {
-            throw new IOException("index and log disagree at offset " + entry.recordPos()
-                    + ": the stored key is not the requested key");
+            throw new IOException("index and log disagree in segment " + entry.fileId()
+                    + " at offset " + entry.recordPos() + ": the stored key is not the requested key");
         }
         if (record.type() != RecordType.PUT) {
-            throw new IOException("tombstone reachable through the index at offset "
-                    + entry.recordPos() + ": internal inconsistency");
+            throw new IOException("tombstone reachable through the index in segment "
+                    + entry.fileId() + " at offset " + entry.recordPos() + ": internal inconsistency");
         }
 
         return record.value();
+    }
+
+    /** What the last recovery found. Never null. */
+    public RecoveryReport recoveryReport() {
+        return report;
     }
 
     /** Number of live keys. */
     public int size() {
         ensureOpen();
         return keyDir.size();
+    }
+
+    /** Number of segment files currently open. */
+    public int segmentCount() {
+        ensureOpen();
+        return channels.size();
     }
 
     @Override
@@ -242,18 +331,20 @@ public final class Bitcask implements AutoCloseable {
         }
         closed = true;
         try {
-            channel.close();
+            for (FileChannel channel : channels.values()) {
+                channel.close();
+            }
         } finally {
             lock.release();
         }
     }
 
-    private void readFully(ByteBuffer buf, long position) throws IOException {
+    private void readFully(FileChannel channel, ByteBuffer buf, long position) throws IOException {
         long at = position;
         while (buf.hasRemaining()) {
             int read = channel.read(buf, at);
             if (read < 0) {
-                throw new IOException("log ended early at offset " + at
+                throw new IOException("segment ended early at offset " + at
                         + ", " + buf.remaining() + " bytes short");
             }
             at += read;
@@ -263,7 +354,7 @@ public final class Bitcask implements AutoCloseable {
     private void writeFully(ByteBuffer buf, long position) throws IOException {
         long at = position;
         while (buf.hasRemaining()) {
-            at += channel.write(buf, at);
+            at += activeChannel.write(buf, at);
         }
     }
 

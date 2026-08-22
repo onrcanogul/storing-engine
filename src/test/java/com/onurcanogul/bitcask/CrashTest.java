@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.store.SegmentFiles;
 import com.onurcanogul.bitcask.recovery.RecoveryReport;
 
 import org.junit.jupiter.api.Test;
@@ -120,14 +121,14 @@ class CrashTest {
     @Test
     void aTornTailIsDiscardedAndAccountedFor() throws Exception {
         int lastAcknowledged = runWriterUntilKilled(SyncPolicy.NEVER);
-        long sizeAtCrash = Files.size(dir.resolve("data.log"));
+        long sizeAtCrash = Files.size(SegmentFiles.pathOf(dir, 1));
 
         try (Bitcask db = Bitcask.open(dir, BitcaskConfig.defaults())) {
             RecoveryReport report = db.recoveryReport();
 
             // Whatever was discarded, it is exactly what recovery says it is.
             assertEquals(sizeAtCrash - report.bytesDiscarded(),
-                    Files.size(dir.resolve("data.log")),
+                    Files.size(SegmentFiles.pathOf(dir, 1)),
                     "the file size must match what the report claims was discarded");
 
             // Nothing acknowledged may be among the losses.
