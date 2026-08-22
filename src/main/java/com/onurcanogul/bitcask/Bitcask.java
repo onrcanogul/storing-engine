@@ -2,6 +2,7 @@ package com.onurcanogul.bitcask;
 
 import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
+import com.onurcanogul.bitcask.format.LogRecord;
 import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
@@ -145,6 +146,47 @@ public final class Bitcask implements AutoCloseable {
         nextSeq = seq + 1;
     }
 
+    /**
+     * Returns the value stored under {@code key}, or {@code null} if there is none.
+     *
+     * <p>Takes no lock: the index lookup is lock-free and the disk read is
+     * positional, so any number of threads may read at once.
+     *
+     * <p>The returned array is freshly allocated and referenced nowhere inside the
+     * engine, so the caller may do as it likes with it.
+     *
+     * @throws IOException if the stored record fails verification
+     */
+    public byte[] get(byte[] key) throws IOException {
+        ensureOpen();
+        validateKey(key);
+
+        KeyDirEntry entry = keyDir.get(ByteBuffer.wrap(key));
+        if (entry == null) {
+            return null;
+        }
+
+        ByteBuffer buf = ByteBuffer.allocate(entry.recordSize());
+        readFully(buf, entry.recordPos());
+        buf.flip();
+
+        LogRecord record = RecordCodec.decode(buf);
+
+        // The checksum proves the record is intact; it cannot prove it is the
+        // right one. A wrong offset lands on a perfectly valid record belonging
+        // to some other key, and only this comparison catches that.
+        if (!Arrays.equals(record.key(), key)) {
+            throw new IOException("index and log disagree at offset " + entry.recordPos()
+                    + ": the stored key is not the requested key");
+        }
+        if (record.type() != RecordType.PUT) {
+            throw new IOException("tombstone reachable through the index at offset "
+                    + entry.recordPos() + ": internal inconsistency");
+        }
+
+        return record.value();
+    }
+
     /** Number of live keys. */
     public int size() {
         ensureOpen();
@@ -161,6 +203,18 @@ public final class Bitcask implements AutoCloseable {
             channel.close();
         } finally {
             lock.release();
+        }
+    }
+
+    private void readFully(ByteBuffer buf, long position) throws IOException {
+        long at = position;
+        while (buf.hasRemaining()) {
+            int read = channel.read(buf, at);
+            if (read < 0) {
+                throw new IOException("log ended early at offset " + at
+                        + ", " + buf.remaining() + " bytes short");
+            }
+            at += read;
         }
     }
 
