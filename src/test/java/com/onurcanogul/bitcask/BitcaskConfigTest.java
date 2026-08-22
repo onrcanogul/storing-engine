@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.recovery.RecoveryMode;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;

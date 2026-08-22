@@ -1,4 +1,4 @@
-package com.onurcanogul.bitcask;
+package com.onurcanogul.bitcask.recovery;
 
 /**
  * What to do when the log turns out to be damaged.

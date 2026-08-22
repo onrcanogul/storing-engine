@@ -1,5 +1,6 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.recovery.RecoveryMode;
 import com.onurcanogul.bitcask.format.FormatLimits;
 
 /**

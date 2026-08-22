@@ -1,5 +1,9 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.recovery.RecoveryReport;
+import com.onurcanogul.bitcask.recovery.RecoveryResult;
+import com.onurcanogul.bitcask.recovery.Recovery;
+import com.onurcanogul.bitcask.recovery.RecoveryMode;
 import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.LogRecord;
@@ -87,11 +91,10 @@ public final class Bitcask implements AutoCloseable {
             }
 
             Map<ByteBuffer, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
+            RecoveryResult recovered = Recovery.replay(channel, keyDir, config.recoveryMode());
 
-            // A real replay replaces this once recovery exists.
-            RecoveryReport report = new RecoveryReport(0, 0, 0, -1, StopReason.CLEAN_EOF);
-
-            return new Bitcask(config, lock, channel, keyDir, report, channel.size(), 1L);
+            return new Bitcask(config, lock, channel, keyDir,
+                    recovered.report(), recovered.endOffset(), recovered.maxSeq() + 1);
 
         } catch (IOException | RuntimeException e) {
             // A half-finished open must not leave the directory locked forever.

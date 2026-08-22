@@ -1,4 +1,4 @@
-package com.onurcanogul.bitcask;
+package com.onurcanogul.bitcask.recovery;
 
 /** Why the recovery scan stopped reading the log. */
 public enum StopReason {

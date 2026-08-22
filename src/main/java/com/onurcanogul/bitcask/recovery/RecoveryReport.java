@@ -1,4 +1,4 @@
-package com.onurcanogul.bitcask;
+package com.onurcanogul.bitcask.recovery;
 
 /**
  * What recovery found while rebuilding the index.

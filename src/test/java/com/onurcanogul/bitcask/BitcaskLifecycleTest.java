@@ -1,5 +1,7 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.recovery.StopReason;
+import com.onurcanogul.bitcask.recovery.RecoveryReport;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
