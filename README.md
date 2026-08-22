@@ -17,7 +17,7 @@ written, and the reasoning behind each decision is recorded in
 
 ## Status
 
-**Phase 1 (core) — nearly complete.** 82 tests passing.
+**Phase 1 (core) is complete.** 89 tests passing.
 
 | | |
 |---|---|
@@ -26,10 +26,10 @@ written, and the reasoning behind each decision is recorded in
 | ✅ | `put` / `get` / `delete` |
 | ✅ | Crash recovery by log replay, with a corruption policy |
 | ✅ | Single-writer enforcement via a directory lock |
-| ⬜ | Model-based testing against a reference `HashMap` |
-| ⬜ | `kill -9` crash test |
+| ✅ | Model-based testing against a reference `HashMap` |
+| ✅ | `kill -9` crash test |
 
-Later phases: segment rotation, compaction, durability tuning, measurement, and
+Next: segment rotation, compaction, durability tuning, measurement, and
 deliberately breaking it. See [Roadmap](#roadmap).
 
 Not intended for production use.
@@ -210,9 +210,16 @@ does.
 | Key ≤ 64 KB, value ≤ 16 MB by default | Format and configuration |
 | Phase 1 only: the log grows without bound | Segment rotation and compaction come next |
 
-Roughly 168 bytes of index memory per key on a 64-bit JVM, measured for a
-16-byte key. That works out to about 1.7 GB for 10 million keys — the number to
-check before reaching for this design.
+**Measured** at 178 bytes of index memory per key on a 64-bit JVM with 16-byte
+keys — about 1.7 GB for 10 million keys. That is the number to check before
+reaching for this design.
+
+Worth knowing which way the trade-off runs: index cost is independent of value
+size. In that measurement, 200,000 keys holding 100-byte values produced a 27 MB
+log and a **34 MB index** — the index was larger than the data it points at. Had
+the values been 10 KB, the log would have been about 2 GB and the index still
+34 MB. This engine earns its keep on large values, and wastes memory on small
+ones.
 
 ---
 
@@ -220,7 +227,7 @@ check before reaching for this design.
 
 | Phase | Content |
 |---|---|
-| **1** | Core: append-only log, in-memory index, crash recovery |
+| **1** ✅ | Core: append-only log, in-memory index, crash recovery |
 | 2 | Segment rotation |
 | 3 | Compaction and hint files |
 | 4 | Durability policies: group commit, write buffering |
@@ -233,6 +240,42 @@ rather than intuition — no write buffer yet, `ByteBuffer` index keys, fsync of
 by default.
 
 ---
+
+## Testing
+
+Three layers, because each catches what the others cannot.
+
+**Unit tests** cover the format, the codec, the file header, and the lock —
+including the cases that only look obvious in hindsight: a key above 32 KB
+(where a plain `readShort()` returns a negative length), and a lookup with a
+`byte[]` that is a *different array object* holding the same bytes (where
+`HashMap<byte[], V>` silently finds nothing).
+
+**Model-based tests** apply random operation sequences to both the engine and a
+plain `HashMap` and compare after every step, reopening the store at
+unpredictable points so recovery is exercised from arbitrary states rather than
+tidy ones. Every assertion carries the seed, so any failure reproduces exactly.
+
+To check these tests actually bite, `delete` was temporarily changed to drop the
+index entry without writing a tombstone. Both model-based tests failed on the
+next reopen — `expected: <42> but was: <50>`, eight deleted keys resurrected by
+replay. The bug is invisible while the engine is running and only appears after
+a restart, which is precisely what a hand-written test tends to miss.
+
+**Crash tests** spawn a writer in its own JVM, `kill -9` it mid-write, and
+verify that every write whose `put` returned is still readable.
+
+One finding worth recording: **`kill -9` cannot produce a torn record.** A
+syscall already inside the kernel completes before the signal is delivered, so
+the log always ends on a record boundary. Torn tails come from power loss, not
+from process death — which is why the truncation tests that damage the file by
+hand are not redundant with the crash test. They cover what it structurally
+cannot reach.
+
+```bash
+mvn test -Dtest=CrashTest        # spawns JVMs, takes a few seconds
+mvn test -Dtest=ModelBasedTest   # 7,500 random operations
+```
 
 ## Building
 
