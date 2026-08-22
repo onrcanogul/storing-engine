@@ -10,7 +10,7 @@ import java.nio.channels.FileChannel;
  *
  * <pre>
  *   offset  size  field
- *        0     4  magic     "BCSK"
+ *        0     4  magic     "ONRC"
  *        4     2  version   format version
  *        6     2  reserved  zero, room for future flags
  * </pre>
@@ -25,8 +25,8 @@ public final class FileHeader {
 
     public static final int SIZE = 8;
 
-    /** ASCII "BCSK". */
-    public static final int MAGIC = 0x4243534B;
+    /** ASCII "ONRC". */
+    public static final int MAGIC = 0x4F4E5243;
 
     public static final short VERSION = 1;
 

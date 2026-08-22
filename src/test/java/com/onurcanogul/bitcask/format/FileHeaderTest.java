@@ -52,7 +52,7 @@ class FileHeaderTest {
 
     @Test
     void unknownVersionIsRejected() throws Exception {
-        writeRaw(new byte[] {'B', 'C', 'S', 'K', 0, 99, 0, 0});
+        writeRaw(new byte[] {'O', 'N', 'R', 'C', 0, 99, 0, 0});
         try (FileChannel channel = openLog()) {
             assertThrows(IOException.class, () -> FileHeader.validate(channel));
         }
@@ -60,7 +60,7 @@ class FileHeaderTest {
 
     @Test
     void truncatedHeaderIsRejected() throws Exception {
-        writeRaw(new byte[] {'B', 'C'});
+        writeRaw(new byte[] {'O', 'N'});
         try (FileChannel channel = openLog()) {
             assertThrows(IOException.class, () -> FileHeader.validate(channel));
         }

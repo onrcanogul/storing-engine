@@ -136,7 +136,7 @@ Java 21 (LTS). Required for `java.util.zip.CRC32C` (Java 9+).
 
 | Offset | Size | Field | Value |
 |---|---|---|---|
-| 0 | 4 | `magic` | `0x42 0x43 0x53 0x4B` (ASCII `"BCSK"`) |
+| 0 | 4 | `magic` | `0x4F 0x4E 0x52 0x43` (ASCII `"ONRC"`) |
 | 4 | 2 | `version` | `1` |
 | 6 | 2 | `reserved` | `0` |
 

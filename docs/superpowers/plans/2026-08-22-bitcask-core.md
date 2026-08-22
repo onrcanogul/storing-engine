@@ -647,7 +647,7 @@ git commit -m "feat: record codec with crc32c over all length fields"
 **Interfaces:**
 - Consumes: `CorruptRecordException`
 - Produces:
-  - `FileHeader.SIZE` = `8`, `FileHeader.MAGIC` = `0x4243534B`, `FileHeader.VERSION` = `(short) 1`
+  - `FileHeader.SIZE` = `8`, `FileHeader.MAGIC` = `0x4F4E5243`, `FileHeader.VERSION` = `(short) 1`
   - `static void write(FileChannel ch) throws IOException` — writes at offset 0
   - `static void validate(FileChannel ch) throws IOException` — throws on bad magic/version
 
@@ -703,7 +703,7 @@ class FileHeaderTest {
     void unknownVersionIsRejected() throws Exception {
         Path p = dir.resolve("data.log");
         try (FileChannel ch = open(p)) {
-            ch.write(ByteBuffer.wrap(new byte[] {'B', 'C', 'S', 'K', 0, 99, 0, 0}), 0);
+            ch.write(ByteBuffer.wrap(new byte[] {'O', 'N', 'R', 'C', 0, 99, 0, 0}), 0);
             assertThrows(IOException.class, () -> FileHeader.validate(ch));
         }
     }
@@ -712,7 +712,7 @@ class FileHeaderTest {
     void truncatedHeaderIsRejected() throws Exception {
         Path p = dir.resolve("data.log");
         try (FileChannel ch = open(p)) {
-            ch.write(ByteBuffer.wrap(new byte[] {'B', 'C'}), 0);
+            ch.write(ByteBuffer.wrap(new byte[] {'O', 'N'}), 0);
             assertThrows(IOException.class, () -> FileHeader.validate(ch));
         }
     }
@@ -738,7 +738,7 @@ import java.nio.channels.FileChannel;
 public final class FileHeader {
 
     public static final int SIZE = 8;
-    public static final int MAGIC = 0x4243534B; // "BCSK"
+    public static final int MAGIC = 0x4F4E5243; // "ONRC"
     public static final short VERSION = 1;
 
     private FileHeader() {}
