@@ -80,7 +80,7 @@ class BitcaskWriteTest {
 
     @Test
     void valueAboveTheConfiguredLimitIsRejected() throws Exception {
-        BitcaskConfig small = new BitcaskConfig(1024, SyncPolicy.NEVER, RecoveryMode.TOLERATE_TAIL);
+        BitcaskConfig small = BitcaskConfig.defaults().withMaxValueSize(1024);
         try (Bitcask db = Bitcask.open(dir, small)) {
             assertThrows(IllegalArgumentException.class, () -> db.put(b("k"), new byte[2048]));
         }
@@ -88,7 +88,7 @@ class BitcaskWriteTest {
 
     @Test
     void aRejectedPutWritesNothing() throws Exception {
-        BitcaskConfig small = new BitcaskConfig(1024, SyncPolicy.NEVER, RecoveryMode.TOLERATE_TAIL);
+        BitcaskConfig small = BitcaskConfig.defaults().withMaxValueSize(1024);
         try (Bitcask db = Bitcask.open(dir, small)) {
             long before = logSize();
             assertThrows(IllegalArgumentException.class, () -> db.put(b("k"), new byte[2048]));
@@ -110,8 +110,7 @@ class BitcaskWriteTest {
 
     @Test
     void alwaysSyncPolicyStillWrites() throws Exception {
-        BitcaskConfig sync = new BitcaskConfig(
-                BitcaskConfig.DEFAULT_MAX_VALUE_SIZE, SyncPolicy.ALWAYS, RecoveryMode.TOLERATE_TAIL);
+        BitcaskConfig sync = BitcaskConfig.defaults().withSyncPolicy(SyncPolicy.ALWAYS);
         try (Bitcask db = Bitcask.open(dir, sync)) {
             db.put(b("k"), b("v"));
 

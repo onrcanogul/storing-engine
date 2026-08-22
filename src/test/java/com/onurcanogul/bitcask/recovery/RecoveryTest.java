@@ -36,8 +36,7 @@ class RecoveryTest {
     }
 
     private BitcaskConfig strict() {
-        return new BitcaskConfig(
-                BitcaskConfig.DEFAULT_MAX_VALUE_SIZE, SyncPolicy.NEVER, RecoveryMode.STRICT);
+        return BitcaskConfig.defaults().withRecoveryMode(RecoveryMode.STRICT);
     }
 
     /** Flips one bit at the given offset, simulating bit rot. */

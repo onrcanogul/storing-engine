@@ -19,10 +19,7 @@ public final class CrashWriterMain {
         Path dir = Path.of(args[0]);
         SyncPolicy syncPolicy = SyncPolicy.valueOf(args[1]);
 
-        BitcaskConfig config = new BitcaskConfig(
-                BitcaskConfig.DEFAULT_MAX_VALUE_SIZE,
-                syncPolicy,
-                com.onurcanogul.bitcask.recovery.RecoveryMode.TOLERATE_TAIL);
+        BitcaskConfig config = BitcaskConfig.defaults().withSyncPolicy(syncPolicy);
 
         // Deliberately not in try-with-resources: this process is meant to die
         // without ever closing the engine.

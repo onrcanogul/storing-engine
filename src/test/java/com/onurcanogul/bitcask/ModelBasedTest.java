@@ -140,10 +140,7 @@ class ModelBasedTest {
         Random random = new Random(seed);
         Map<String, byte[]> model = new HashMap<>();
 
-        BitcaskConfig synced = new BitcaskConfig(
-                BitcaskConfig.DEFAULT_MAX_VALUE_SIZE,
-                SyncPolicy.ALWAYS,
-                com.onurcanogul.bitcask.recovery.RecoveryMode.TOLERATE_TAIL);
+        BitcaskConfig synced = BitcaskConfig.defaults().withSyncPolicy(SyncPolicy.ALWAYS);
 
         try (Bitcask db = Bitcask.open(dir, synced)) {
             for (int op = 0; op < 500; op++) {
