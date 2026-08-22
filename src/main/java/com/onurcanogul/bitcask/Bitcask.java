@@ -1,6 +1,9 @@
 package com.onurcanogul.bitcask;
 
 import com.onurcanogul.bitcask.format.FileHeader;
+import com.onurcanogul.bitcask.format.FormatLimits;
+import com.onurcanogul.bitcask.format.RecordCodec;
+import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
 import com.onurcanogul.bitcask.store.DirectoryLock;
 
@@ -10,6 +13,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -101,6 +105,46 @@ public final class Bitcask implements AutoCloseable {
         return report;
     }
 
+    /**
+     * Stores {@code value} under {@code key}, replacing any previous value.
+     *
+     * <p>Serialized: this is the single writer. Readers never take this lock.
+     *
+     * <p>The key is copied; the value is not, since it is written to disk and
+     * then released. Mutating either array after this call returns is safe.
+     *
+     * @throws IllegalArgumentException if the key is empty or either side is over its limit
+     */
+    public synchronized void put(byte[] key, byte[] value) throws IOException {
+        ensureOpen();
+        validateKey(key);
+
+        byte[] storedValue = (value == null) ? new byte[0] : value;
+        if (storedValue.length > config.maxValueSize()) {
+            throw new IllegalArgumentException(
+                    "value too large: " + storedValue.length + " > " + config.maxValueSize());
+        }
+
+        long seq = nextSeq;
+        ByteBuffer record = RecordCodec.encode(
+                seq, System.currentTimeMillis(), RecordType.PUT, key, storedValue);
+        int size = record.remaining();
+        long position = writePos;
+
+        writeFully(record, position);
+        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
+            channel.force(false);
+        }
+
+        // Disk before memory. In the other order a failed write would leave the
+        // index pointing at a record that does not exist.
+        keyDir.put(indexKeyCopyOf(key), new KeyDirEntry(0, position, size, seq));
+
+        // Advanced last, so a failed write leaves no gap in the log.
+        writePos = position + size;
+        nextSeq = seq + 1;
+    }
+
     /** Number of live keys. */
     public int size() {
         ensureOpen();
@@ -117,6 +161,35 @@ public final class Bitcask implements AutoCloseable {
             channel.close();
         } finally {
             lock.release();
+        }
+    }
+
+    private void writeFully(ByteBuffer buf, long position) throws IOException {
+        long at = position;
+        while (buf.hasRemaining()) {
+            at += channel.write(buf, at);
+        }
+    }
+
+    /**
+     * Copies the key before wrapping it as an index key.
+     *
+     * <p>Without the copy, a caller reusing its buffer would mutate the array the
+     * map is keyed on. The entry would then be unfindable under either the old or
+     * the new key — alive in memory, unreachable in practice — while the record on
+     * disk stayed perfectly correct.
+     */
+    private static ByteBuffer indexKeyCopyOf(byte[] key) {
+        return ByteBuffer.wrap(Arrays.copyOf(key, key.length));
+    }
+
+    private static void validateKey(byte[] key) {
+        if (key == null || key.length == 0) {
+            throw new IllegalArgumentException("key must not be empty");
+        }
+        if (key.length > FormatLimits.MAX_KEY_SIZE) {
+            throw new IllegalArgumentException(
+                    "key too long: " + key.length + " > " + FormatLimits.MAX_KEY_SIZE);
         }
     }
 
