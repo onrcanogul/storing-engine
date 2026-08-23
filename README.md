@@ -17,7 +17,7 @@ written, and the reasoning behind each decision is recorded in
 
 ## Status
 
-**Phases 1 and 2 are complete.** 124 tests passing.
+**Phases 1 through 3 are complete.** 178 tests passing.
 
 | | |
 |---|---|
@@ -29,8 +29,13 @@ written, and the reasoning behind each decision is recorded in
 | ✅ | Model-based testing against a reference `HashMap` |
 | ✅ | `kill -9` crash tests, including mid-rotation |
 | ✅ | Segment rotation into immutable closed segments |
+| ✅ | Compaction: live records copied forward, dead segments dropped |
+| ✅ | Garbage accounted incrementally, so nothing is scanned to decide |
+| ✅ | Tombstone lifetime: a deletion stops costing once it can cancel nothing |
+| ✅ | Concurrent readers and a writer through repeated merges |
+| ✅ | Hint files: startup skips the log for closed segments |
 
-Next: compaction, durability tuning, measurement, and deliberately breaking it.
+Next: durability tuning, measurement, and deliberately breaking it.
 See [Roadmap](#roadmap).
 
 Not intended for production use.
@@ -70,8 +75,10 @@ receives every write; the rest are closed and never change again.
 
 ```
 data-0000000001.log   closed, fsynced, immutable
+hint-0000000001.idx   its index without the values, so startup can skip the log
 data-0000000002.log   closed, fsynced, immutable
-data-0000000003.log   active — writes land here
+hint-0000000002.idx
+data-0000000003.log   active — writes land here, no hint until it closes
 bitcask.lock
 ```
 
@@ -165,6 +172,62 @@ For the active segment, the choice is the application's:
 Recovery never fails silently. `RecoveryReport` carries the record count, the
 byte count discarded, the truncation offset, and why the scan stopped.
 
+### Compacting
+
+Nothing is erased in place, so the space an overwrite or a delete frees is
+reclaimed only by rewriting. A merge takes the closed segments that are mostly
+garbage, copies whatever is still live into the active segment, and deletes the
+originals.
+
+Which segments those are is answered from counters kept as writes happen: every
+record that supersedes another adds its predecessor's length to the dead-byte
+total of whichever segment holds it. Deciding what to merge costs a map lookup,
+not a scan.
+
+Three rules make it safe to run while the store is in use:
+
+- **A record is copied only if the index still points at exactly it** — same
+  segment, same offset. A key rewritten in the meantime makes the old record
+  stale, and copying it anyway would bring an old value back to life. The check
+  and the copy happen under one lock, so nothing can slip between them.
+- **A source segment is deleted only once the copies are on the disk.** One
+  fsync per merge, and the thing the whole operation rests on: a power failure
+  between the copy and the delete would otherwise take both, which turns
+  compaction into data loss.
+- **A tombstone is dropped once nothing older survives.** A deletion cancels a
+  PUT older than itself, so if every segment older than the tombstone's is being
+  deleted in this same merge, there is nothing left for it to cancel. Without
+  that rule, every deletion would be copied forward on every merge, forever.
+
+A crash partway through leaves duplicates, never gaps. The copies carry higher
+sequence numbers, so recovery prefers them, and whichever sources were not
+deleted are ordinary garbage for the next merge to collect.
+
+### Starting up without reading the log
+
+Replaying a segment reads every record whole — key, value, checksum over all of
+it — to end up storing a key, an offset, a length and a sequence number. The
+values are read and thrown away, which makes opening a store cost what it weighs
+rather than what it indexes.
+
+So each segment, as it closes, gets a hint file beside it: one entry per record,
+holding exactly what the index needs and no values. The writer already knows all
+of it at the moment it appends, so the entries are collected as it goes and
+written at rotation, with no pass over the segment. A closed segment with a hint
+is loaded without its log being opened at all.
+
+On a 52 MB store of 1 KB values the hints come to 1.4 MB — under 3% — and
+opening it takes 18 ms against 56 ms of scanning. That measurement has a warm
+page cache, which is the *best* case for scanning; the gap widens when the bytes
+have to come off the disk.
+
+**A hint file is a cache, never a source of truth.** Everything in one can be
+recomputed by reading the segment, so anything doubtful about it — a bad
+checksum, a length that disagrees with the segment, entries that do not run end
+to end across the file — means it is dropped and the log is read the old way.
+Refusing a good hint costs one slow segment scan. Believing a bad one loses data
+with nothing to notice.
+
 ---
 
 ## Some decisions worth explaining
@@ -238,7 +301,9 @@ does.
 | No multi-key atomicity | Each operation stands alone |
 | Key ≤ 64 KB, value ≤ 16 MB by default | Format and configuration |
 | One open file descriptor per segment | The index points into every segment, so all stay open |
-| Until compaction lands: superseded records are never reclaimed | Phase 3 |
+| Compaction is manual — nothing schedules `merge()` | The application decides when to pay for it |
+| A merge takes the write lock once per record | A writer that never pauses can starve it — Phase 4 |
+| A segment is fsynced at rotation while the write lock is held | Small segments turn that into a write-latency problem — Phase 4 |
 
 **Measured** at 178 bytes of index memory per key on a 64-bit JVM with 16-byte
 keys — about 1.7 GB for 10 million keys. That is the number to check before
@@ -266,7 +331,7 @@ ones.
 |---|---|
 | **1** ✅ | Core: append-only log, in-memory index, crash recovery |
 | **2** ✅ | Segment rotation |
-| 3 | Compaction and hint files |
+| **3** ✅ | Compaction and hint files |
 | 4 | Durability policies: group commit, write buffering |
 | 5 | Measurement: throughput, p99 latency, memory profile |
 | 6 | Breaking it: `kill -9`, torn writes, bit rot, disk full |
@@ -280,7 +345,7 @@ by default.
 
 ## Testing
 
-Three layers, because each catches what the others cannot.
+Six layers, because each catches what the others structurally cannot.
 
 **Unit tests** cover the format, the codec, the file header, and the lock —
 including the cases that only look obvious in hindsight: a key above 32 KB
@@ -318,9 +383,64 @@ from process death — which is why the truncation tests that damage the file by
 hand are not redundant with the crash test. They cover what it structurally
 cannot reach.
 
+**Concurrency tests** keep four readers and a writer going while merges run
+against them in a loop. The window worth testing — a reader holding an index
+entry for a segment a merge is about to delete — is a few microseconds wide and
+cannot be arranged from outside, so it is hit by volume instead.
+
+The first version of them hung forever. Not a deadlock: the writer holds the
+write lock for each record and fsyncs inside it at every rotation, while a merge
+asks for that same lock once per record. `synchronized` promises no fairness, so
+the writer took back the lock it had just released and the merge advanced at
+close to nothing. **A loop of "twenty merges" is not a bound — it hangs instead
+of failing.** Those tests are now bounded by wall clock and carry a `@Timeout`.
+What starved the merge is a real property of the engine, not of the test, and is
+on the list for the durability phase.
+
+**Ordering tests** count fsyncs. Durability is a property of the order in which
+two writes reach the disk, and that order cannot be seen from outside — which is
+where the previous layer runs out:
+
+**`kill -9` cannot test an fsync.** It takes the process, not the page cache;
+the kernel writes those pages out afterwards, so an engine that never fsyncs
+passes every crash test unharmed. Only power loss tells the difference.
+
+This is how the missing fsync in compaction was found: the merge deleted its
+source segments having synced nothing, so a power failure between the two would
+have taken the copies and the originals together. The test asserts on the call
+order — that some sync happened before the first delete — and before the
+one-line fix it failed with the same number on both sides: seven syncs when the
+merge began, seven still when it reached the first delete.
+
+**Merge-crash tests** halt a forked JVM at named points inside a merge: mid-copy,
+after all copies and before any delete, and between two deletes. Each point is
+one test, and the invariant is checked on whatever the directory was left
+holding — nothing lost, nothing rolled back, nothing resurrected, key count
+unchanged. The engine carries a seam for this, a no-op unless a test sets it,
+because a random kill would essentially never land in a window that narrow.
+
+Two of those three passed the first time they ran, so they lock in a guarantee
+rather than having driven one. To find out whether they check anything at all,
+the engine was mutated: a merge copy made to carry its original sequence number
+instead of a higher one. Two of the three went red — caught, as it happens, by
+recovery's own monotonic-sequence check rather than by the assertion that was
+aiming at it.
+
+The hint tests turned up a sharper version of the same lesson. Removing the step
+that seeds the writer with what recovery found — the bug that would give a
+segment written across a restart a hint describing only half of it — failed
+nothing. The reason is that loading refuses any hint whose entries do not run end
+to end across the whole segment, so the incomplete one was caught and the segment
+scanned, and the data came out right. Two defences, and the test was only holding
+one of them. It now asserts that every closed segment was loaded *from a hint*,
+and the mutation turns it red.
+
 ```bash
-mvn test -Dtest=CrashTest        # spawns JVMs, takes a few seconds
-mvn test -Dtest=ModelBasedTest   # 7,500 random operations
+mvn test -Dtest=CrashTest             # spawns JVMs, takes a few seconds
+mvn test -Dtest=ModelBasedTest        # 7,500 random operations
+mvn test -Dtest=ConcurrentMergeTest   # readers, a writer and merges at once
+mvn test -Dtest=MergeCrashTest        # halts a JVM inside a merge
+mvn test -Dtest=HintStartupTest       # startup with, without and against hints
 ```
 
 ## Building

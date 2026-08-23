@@ -580,6 +580,58 @@ reopen, and verify:
 
 This is the direct test of the Phase 1 success criterion (§1.2).
 
+### Layer 4 — Concurrency
+
+Readers and a writer work continuously while merges run against them. The window
+worth testing — a reader holding an index entry for a segment a merge then
+deletes — is a few microseconds wide and cannot be staged from outside, so it is
+hit by volume rather than by arrangement. A failure shows up as a thrown
+exception or a wrong value, not as a flaky assertion.
+
+**Such a test is bounded by wall clock, never by a count of work done.** A merge
+takes the write lock once per record and `synchronized` promises no fairness, so
+a writer that never pauses can starve one indefinitely. A loop of "twenty merges"
+is not a bound: it hangs instead of failing. Every test in this layer also
+carries a `@Timeout`, so a starved run is reported rather than waited on.
+
+### Layer 5 — Ordering
+
+Durability is a property of the *order* in which two writes reach the disk, and
+that order cannot be observed from the outside.
+
+**A process crash cannot test an fsync.** `kill -9` takes the process, not the
+page cache; the kernel writes those pages out afterwards, so an engine that never
+fsyncs survives every crash test unharmed. Only power loss tells the difference.
+
+The engine therefore counts its own fsyncs, and the test asserts on the order of
+the calls: that a merge has synced its copies before it deletes the segments they
+came from. This layer exists because Layer 3 structurally cannot reach it.
+
+### Layer 6 — Crash At A Chosen Point
+
+Layer 3 kills a process at an arbitrary moment, which is the right test for a
+writer doing the same thing over and over. It is the wrong test for compaction,
+where the moments that matter are between a copy and a delete and pass in
+microseconds.
+
+The engine exposes a seam — named points inside a merge, a no-op unless a test
+sets it — and a forked JVM halts at one of them. Each point becomes one named
+test, and the invariant is checked on whatever the directory was left holding:
+nothing lost, nothing rolled back to an older value, nothing resurrected.
+
+The seam is the cost of the layer. It is production code that exists for tests,
+which is worth it here because the alternative is a random kill that almost never
+lands in the window.
+
+### On Tests That Never Fail
+
+A test written after the code it covers has proved nothing until it has been seen
+red. Where that was not possible — the guarantee already held — the engine is
+mutated instead: a merge copy made to carry its original sequence number, a
+recovery step made to forget what it found. A test that stays green under the
+mutation is not testing what its name claims, and two of them were rewritten for
+exactly that reason.
+
 ### TDD Note
 
 Implementation order will differ from the order of this document. The format
@@ -594,7 +646,7 @@ round-trip (§4) is the most isolated and testable starting point; the contract
 
 | Item | Phase |
 |---|---|
-| Tombstone lifetime — when a tombstone may be discarded | 3 |
+| ~~Tombstone lifetime — when a tombstone may be discarded~~ — done in Phase 3 | 3 |
 | Write buffering, measured before and after | 4 |
 | `INTERVAL` fsync mode and group commit | 4 |
 | Hash-based KeyDir (~50 bytes/key instead of ~168, with collisions resolved by verifying the key read from disk) | 5–6, if measurement justifies it |
