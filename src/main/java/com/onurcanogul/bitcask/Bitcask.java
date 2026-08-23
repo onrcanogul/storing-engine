@@ -30,6 +30,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -63,6 +64,26 @@ public final class Bitcask implements AutoCloseable {
 
     /** Serialises merges against each other without blocking ordinary writes. */
     private final Object mergeLock = new Object();
+
+    /**
+     * Called at named points inside a merge. Does nothing unless a test says so.
+     *
+     * <p>A merge crash cannot be staged from the outside: the interesting moments
+     * are between a copy and a delete, and they pass in microseconds. This is the
+     * seam a crash test halts the JVM on. Production never sets it.
+     */
+    volatile Consumer<String> mergeHook = point -> {
+    };
+
+    /**
+     * How many times the active segment has been fsynced.
+     *
+     * <p>Exists because durability is an ordering property, and ordering is not
+     * observable from the outside: killing a process does not empty the page
+     * cache, so a missing fsync looks exactly like a present one. Counting the
+     * calls is the only way a test can hold the engine to the order it promises.
+     */
+    final AtomicLong syncCount = new AtomicLong();
 
     /**
      * Bytes per segment held by records that have since been superseded.
@@ -255,7 +276,7 @@ public final class Bitcask implements AutoCloseable {
 
         writeFully(record, position);
         if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            activeChannel.force(false);
+            forceActive();
         }
 
         // Disk before memory. In the other order a failed write would leave the
@@ -265,6 +286,17 @@ public final class Bitcask implements AutoCloseable {
         // Advanced last, so a failed write leaves no gap in the log.
         writePos = position + size;
         nextSeq = seq + 1;
+    }
+
+    /**
+     * Pushes the active segment to the disk itself, not just to the page cache.
+     *
+     * <p>Every fsync in the engine goes through here so that {@link #syncCount}
+     * stays honest.
+     */
+    private void forceActive() throws IOException {
+        activeChannel.force(false);
+        syncCount.incrementAndGet();
     }
 
     /**
@@ -279,7 +311,7 @@ public final class Bitcask implements AutoCloseable {
      * <p>The old channel stays open — the index still points into it.
      */
     private void rotate() throws IOException {
-        activeChannel.force(false);
+        forceActive();
 
         int newFileId = activeFileId + 1;
         // CREATE_NEW rather than CREATE: if that file somehow exists, something
@@ -449,17 +481,57 @@ public final class Bitcask implements AutoCloseable {
                 if (written > 0) {
                     moved++;
                     bytesWritten += written;
+                    mergeHook.accept(MergeHookPoint.MID_COPY);
                 } else {
                     discarded++;
                 }
             }
         }
 
+        // Durability ordering, and the one step this whole method rests on: a
+        // source segment may only be deleted once the copies taken out of it are
+        // on the disk. Skip it and a power failure here takes both the copy and
+        // the original, which turns compaction into data loss. Rotation has
+        // already fsynced every earlier output segment, so one call covers the
+        // rest of them.
+        syncMergeOutput();
+
+        mergeHook.accept(MergeHookPoint.BEFORE_DROP);
+
+        boolean firstDropped = false;
         for (int fileId : candidates) {
             dropSegment(fileId);
+            if (!firstDropped) {
+                firstDropped = true;
+                mergeHook.accept(MergeHookPoint.MID_DROP);
+            }
         }
 
         return new MergeReport(candidates, moved, discarded, bytesBefore - bytesWritten);
+    }
+
+    /**
+     * Fsyncs the segment the merge has been copying into.
+     *
+     * <p>Synchronized because {@code activeChannel} belongs to the writer: a
+     * rotation could be swapping it out at this very moment, and forcing the
+     * channel that is on its way out would prove nothing about the new one.
+     */
+    private synchronized void syncMergeOutput() throws IOException {
+        forceActive();
+    }
+
+    /** Where inside a merge {@link #mergeHook} is called. */
+    static final class MergeHookPoint {
+        /** A record has just been copied forward; the rest have not. */
+        static final String MID_COPY = "mid-copy";
+        /** Every live record is copied; no source segment is deleted yet. */
+        static final String BEFORE_DROP = "before-drop";
+        /** The first source segment is deleted; the others are still there. */
+        static final String MID_DROP = "mid-drop";
+
+        private MergeHookPoint() {
+        }
     }
 
     /** One record read out of a segment being merged. */
@@ -536,7 +608,7 @@ public final class Bitcask implements AutoCloseable {
 
         writeFully(record, position);
         if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            activeChannel.force(false);
+            forceActive();
         }
 
         if (indexKey != null) {
