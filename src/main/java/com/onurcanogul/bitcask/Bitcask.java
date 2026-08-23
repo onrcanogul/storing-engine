@@ -1,10 +1,12 @@
 package com.onurcanogul.bitcask;
 
 import com.onurcanogul.bitcask.compaction.CompactionStats;
+import com.onurcanogul.bitcask.compaction.MergeReport;
 import com.onurcanogul.bitcask.compaction.SegmentStats;
 import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.LogRecord;
+import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
@@ -25,7 +27,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -332,6 +336,192 @@ public final class Bitcask implements AutoCloseable {
         }
 
         return record.value();
+    }
+
+
+    /**
+     * Reclaims space by rewriting live records and dropping the segments that
+     * held them.
+     *
+     * <p>Live records are copied forward through the ordinary write path, into
+     * the active segment with fresh sequence numbers, rather than into a separate
+     * merge file. That keeps a rule the whole design leans on: a later record is
+     * a newer record. A merge file would carry old data under a new file id, and
+     * recovery — which walks segments in order — would then see sequence numbers
+     * going backwards, or worse, let a stale value overwrite a current one.
+     *
+     * <p>Each record is examined and copied under the write lock, but the lock is
+     * released between records, so ordinary writes are interleaved rather than
+     * blocked. If a key is rewritten while its old record is being considered,
+     * the liveness check sees that the index has moved on and skips it — a stale
+     * value can never come back.
+     *
+     * <p>Segments are deleted only after everything live has been copied. A crash
+     * partway through leaves duplicates, not gaps: the copies carry higher
+     * sequence numbers, so recovery prefers them, and the originals become
+     * garbage for the next merge to collect.
+     *
+     * @return what was done, or {@link MergeReport#nothingToDo()} if no segment
+     *         was dirty enough to be worth rewriting
+     */
+    public MergeReport merge() throws IOException {
+        ensureOpen();
+
+        List<Integer> candidates = compactionStats()
+                .mergeCandidates(config.mergeThreshold())
+                .stream()
+                .map(SegmentStats::fileId)
+                .toList();
+
+        if (candidates.isEmpty()) {
+            return MergeReport.nothingToDo();
+        }
+
+        long bytesBefore = 0;
+        for (int fileId : candidates) {
+            bytesBefore += channels.get(fileId).size();
+        }
+
+        long moved = 0;
+        long discarded = 0;
+        long bytesWritten = 0;
+
+        // One tombstone per key is enough to keep a deletion alive.
+        Set<ByteBuffer> tombstonesKept = new HashSet<>();
+
+        for (int fileId : candidates) {
+            for (SourceRecord source : readSegment(fileId)) {
+                long written = copyForwardIfStillNeeded(source, tombstonesKept);
+                if (written > 0) {
+                    moved++;
+                    bytesWritten += written;
+                } else {
+                    discarded++;
+                }
+            }
+        }
+
+        for (int fileId : candidates) {
+            dropSegment(fileId);
+        }
+
+        return new MergeReport(candidates, moved, discarded, bytesBefore - bytesWritten);
+    }
+
+    /** One record read out of a segment being merged. */
+    private record SourceRecord(int fileId, long position, int size, LogRecord record) {
+    }
+
+    /**
+     * Copies a record forward if the index still needs it.
+     *
+     * <p>Synchronized against the writer: the liveness check and the write that
+     * follows it have to be one step. Between them, a competing {@code put} could
+     * make this record stale, and copying it anyway would resurrect an old value.
+     *
+     * @return bytes written, or 0 if the record was not worth keeping
+     */
+    private synchronized long copyForwardIfStillNeeded(SourceRecord source,
+                                                       Set<ByteBuffer> tombstonesKept)
+            throws IOException {
+        LogRecord record = source.record();
+        ByteBuffer key = ByteBuffer.wrap(record.key());
+        KeyDirEntry current = keyDir.get(key);
+
+        if (record.type() == RecordType.TOMBSTONE) {
+            // The key is live again, so a later PUT already overrode this
+            // tombstone and it has nothing left to cancel.
+            if (current != null) {
+                return 0;
+            }
+            // Keep exactly one: dropping them all would let an older PUT in an
+            // unmerged segment resurrect the key on the next replay.
+            if (!tombstonesKept.add(ByteBuffer.wrap(Arrays.copyOf(record.key(), record.key().length)))) {
+                return 0;
+            }
+            return appendDuringMerge(RecordType.TOMBSTONE, record.key(), new byte[0], null);
+        }
+
+        // Position, not sequence: this asks whether the index points at exactly
+        // this record, which also rules out another copy of the same key.
+        boolean stillCurrent = current != null
+                && current.fileId() == source.fileId()
+                && current.recordPos() == source.position();
+
+        if (!stillCurrent) {
+            return 0;
+        }
+        return appendDuringMerge(RecordType.PUT, record.key(), record.value(), key);
+    }
+
+    /**
+     * Appends a record on behalf of the merge.
+     *
+     * <p>Deliberately does not go through {@link #recordSuperseded}: the record
+     * being replaced lives in a segment that is about to be deleted, so counting
+     * it as garbage would inflate a number that is about to disappear.
+     */
+    private long appendDuringMerge(RecordType type, byte[] key, byte[] value, ByteBuffer indexKey)
+            throws IOException {
+        int size = RecordCodec.recordSize(key.length, value.length);
+        if (writePos + size > config.maxSegmentSize()) {
+            rotate();
+        }
+
+        long seq = nextSeq;
+        ByteBuffer record = RecordCodec.encode(seq, System.currentTimeMillis(), type, key, value);
+        long position = writePos;
+
+        writeFully(record, position);
+        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
+            activeChannel.force(false);
+        }
+
+        if (indexKey != null) {
+            keyDir.put(indexKeyCopyOf(key), new KeyDirEntry(activeFileId, position, size, seq));
+        }
+
+        writePos = position + size;
+        nextSeq = seq + 1;
+        return size;
+    }
+
+    /** Reads every record in a segment, so the merge can decide about each one. */
+    private List<SourceRecord> readSegment(int fileId) throws IOException {
+        FileChannel channel = channels.get(fileId);
+        List<SourceRecord> records = new ArrayList<>();
+
+        long size = channel.size();
+        long position = FileHeader.SIZE;
+
+        while (position < size) {
+            ByteBuffer header = ByteBuffer.allocate(RecordCodec.HEADER_SIZE);
+            readFully(channel, header, position);
+            header.flip();
+
+            int keyLen = header.getShort(21) & 0xFFFF;
+            long valLen = header.getInt(23) & 0xFFFFFFFFL;
+            int recordSize = RecordCodec.recordSize(keyLen, (int) valLen);
+
+            ByteBuffer full = ByteBuffer.allocate(recordSize);
+            readFully(channel, full, position);
+            full.flip();
+
+            records.add(new SourceRecord(fileId, position, recordSize, RecordCodec.decode(full)));
+            position += recordSize;
+        }
+        return records;
+    }
+
+    /** Closes and deletes a segment whose live records have all been copied out. */
+    private synchronized void dropSegment(int fileId) throws IOException {
+        FileChannel channel = channels.remove(fileId);
+        deadBytes.remove(fileId);
+
+        if (channel != null) {
+            channel.close();
+        }
+        Files.deleteIfExists(SegmentFiles.pathOf(directory, fileId));
     }
 
     /**

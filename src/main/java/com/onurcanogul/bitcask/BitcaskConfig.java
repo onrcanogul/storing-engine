@@ -15,11 +15,19 @@ import com.onurcanogul.bitcask.recovery.RecoveryMode;
 public record BitcaskConfig(int maxValueSize,
                             SyncPolicy syncPolicy,
                             RecoveryMode recoveryMode,
-                            int maxSegmentSize) {
+                            int maxSegmentSize,
+                            double mergeThreshold) {
 
     public static final int DEFAULT_MAX_VALUE_SIZE = 16 * 1024 * 1024;
 
     public static final int DEFAULT_MAX_SEGMENT_SIZE = 128 * 1024 * 1024;
+
+    /**
+     * Fraction of a segment that must be garbage before merging it is worth the
+     * read-and-rewrite it costs. At one half, a merge rewrites half of what it
+     * reads and reclaims the other half.
+     */
+    public static final double DEFAULT_MERGE_THRESHOLD = 0.5;
 
     public BitcaskConfig {
         if (maxValueSize <= 0) {
@@ -32,6 +40,10 @@ public record BitcaskConfig(int maxValueSize,
         }
         if (maxSegmentSize <= 0) {
             throw new IllegalArgumentException("maxSegmentSize must be positive: " + maxSegmentSize);
+        }
+
+        if (mergeThreshold < 0.0 || mergeThreshold > 1.0) {
+            throw new IllegalArgumentException("mergeThreshold must be between 0 and 1: " + mergeThreshold);
         }
 
         int required = smallestUsableSegmentSize(maxValueSize);
@@ -68,22 +80,27 @@ public record BitcaskConfig(int maxValueSize,
                 DEFAULT_MAX_VALUE_SIZE,
                 SyncPolicy.NEVER,
                 RecoveryMode.TOLERATE_TAIL,
-                DEFAULT_MAX_SEGMENT_SIZE);
+                DEFAULT_MAX_SEGMENT_SIZE,
+                DEFAULT_MERGE_THRESHOLD);
     }
 
     public BitcaskConfig withMaxValueSize(int newMaxValueSize) {
-        return new BitcaskConfig(newMaxValueSize, syncPolicy, recoveryMode, maxSegmentSize);
+        return new BitcaskConfig(newMaxValueSize, syncPolicy, recoveryMode, maxSegmentSize, mergeThreshold);
     }
 
     public BitcaskConfig withSyncPolicy(SyncPolicy newSyncPolicy) {
-        return new BitcaskConfig(maxValueSize, newSyncPolicy, recoveryMode, maxSegmentSize);
+        return new BitcaskConfig(maxValueSize, newSyncPolicy, recoveryMode, maxSegmentSize, mergeThreshold);
     }
 
     public BitcaskConfig withRecoveryMode(RecoveryMode newRecoveryMode) {
-        return new BitcaskConfig(maxValueSize, syncPolicy, newRecoveryMode, maxSegmentSize);
+        return new BitcaskConfig(maxValueSize, syncPolicy, newRecoveryMode, maxSegmentSize, mergeThreshold);
     }
 
     public BitcaskConfig withMaxSegmentSize(int newMaxSegmentSize) {
-        return new BitcaskConfig(maxValueSize, syncPolicy, recoveryMode, newMaxSegmentSize);
+        return new BitcaskConfig(maxValueSize, syncPolicy, recoveryMode, newMaxSegmentSize, mergeThreshold);
+    }
+
+    public BitcaskConfig withMergeThreshold(double newMergeThreshold) {
+        return new BitcaskConfig(maxValueSize, syncPolicy, recoveryMode, maxSegmentSize, newMergeThreshold);
     }
 }
