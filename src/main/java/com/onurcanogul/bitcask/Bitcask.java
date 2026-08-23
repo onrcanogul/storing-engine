@@ -7,7 +7,6 @@ import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.LogRecord;
 import com.onurcanogul.bitcask.format.RecordCodec;
-import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
 import com.onurcanogul.bitcask.recovery.Recovery;
@@ -19,13 +18,13 @@ import com.onurcanogul.bitcask.store.SegmentFiles;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.HashSet;
 import java.util.Map;
@@ -54,8 +53,16 @@ public final class Bitcask implements AutoCloseable {
     private final Map<ByteBuffer, KeyDirEntry> keyDir;
     private final RecoveryReport report;
 
-    /** Every segment stays open: the index points into all of them. */
+    /**
+     * Every segment stays open: the index points into all of them.
+     *
+     * <p>Concurrent because readers look segments up without the write lock,
+     * while rotation and merging add and remove entries.
+     */
     private final Map<Integer, FileChannel> channels;
+
+    /** Serialises merges against each other without blocking ordinary writes. */
+    private final Object mergeLock = new Object();
 
     /**
      * Bytes per segment held by records that have since been superseded.
@@ -66,7 +73,9 @@ public final class Bitcask implements AutoCloseable {
      */
     private final Map<Integer, AtomicLong> deadBytes;
 
-    private int activeFileId;
+    /** Read by {@code get} and {@code compactionStats} without the write lock. */
+    private volatile int activeFileId;
+
     private FileChannel activeChannel;
     private long writePos;
     private long nextSeq;
@@ -109,7 +118,7 @@ public final class Bitcask implements AutoCloseable {
         Files.createDirectories(dir);
         DirectoryLock lock = DirectoryLock.acquire(dir);
 
-        Map<Integer, FileChannel> channels = new HashMap<>();
+        Map<Integer, FileChannel> channels = new ConcurrentHashMap<>();
         try {
             SegmentFiles.adoptLegacyLog(dir);
 
@@ -306,19 +315,47 @@ public final class Bitcask implements AutoCloseable {
         ensureOpen();
         validateKey(key);
 
-        KeyDirEntry entry = keyDir.get(ByteBuffer.wrap(key));
-        if (entry == null) {
-            return null;
-        }
+        ByteBuffer lookupKey = ByteBuffer.wrap(key);
+        KeyDirEntry entry = keyDir.get(lookupKey);
 
+        while (true) {
+            if (entry == null) {
+                return null;
+            }
+            try {
+                return readAt(entry, key);
+            } catch (SegmentGoneException e) {
+                // A merge copied this record elsewhere and dropped the segment it
+                // used to live in. Nothing is wrong; the entry in hand is stale.
+                KeyDirEntry current = keyDir.get(lookupKey);
+                if (entry.equals(current)) {
+                    throw new IOException("segment " + entry.fileId()
+                            + " is gone but the index still points at it: internal inconsistency", e);
+                }
+                entry = current;
+            }
+        }
+    }
+
+    /** Raised when the segment an entry names has been merged away mid-read. */
+    private static final class SegmentGoneException extends IOException {
+        SegmentGoneException(String message) {
+            super(message);
+        }
+    }
+
+    private byte[] readAt(KeyDirEntry entry, byte[] key) throws IOException {
         FileChannel channel = channels.get(entry.fileId());
         if (channel == null) {
-            throw new IOException("index points at segment " + entry.fileId()
-                    + ", which is not open: internal inconsistency");
+            throw new SegmentGoneException("segment " + entry.fileId() + " is no longer open");
         }
 
         ByteBuffer buf = ByteBuffer.allocate(entry.recordSize());
-        readFully(channel, buf, entry.recordPos());
+        try {
+            readFully(channel, buf, entry.recordPos());
+        } catch (ClosedChannelException e) {
+            throw new SegmentGoneException("segment " + entry.fileId() + " closed while being read");
+        }
         buf.flip();
 
         LogRecord record = RecordCodec.decode(buf);
@@ -366,9 +403,16 @@ public final class Bitcask implements AutoCloseable {
      */
     public MergeReport merge() throws IOException {
         ensureOpen();
+        synchronized (mergeLock) {
+            return runMerge();
+        }
+    }
 
-        List<Integer> candidates = compactionStats()
-                .mergeCandidates(config.mergeThreshold())
+    private MergeReport runMerge() throws IOException {
+        // One snapshot for both decisions below, so they cannot disagree about
+        // which segments exist while a writer is rotating underneath us.
+        CompactionStats stats = compactionStats();
+        List<Integer> candidates = stats.mergeCandidates(config.mergeThreshold())
                 .stream()
                 .map(SegmentStats::fileId)
                 .toList();
@@ -376,6 +420,16 @@ public final class Bitcask implements AutoCloseable {
         if (candidates.isEmpty()) {
             return MergeReport.nothingToDo();
         }
+
+        // The oldest closed segment this merge is leaving behind. A tombstone in
+        // an older segment than this one has nothing left to cancel: every
+        // segment that could still hold its PUT is about to be deleted.
+        Set<Integer> candidateSet = new HashSet<>(candidates);
+        int oldestSurvivor = stats.segments().stream()
+                .filter(segment -> !segment.active() && !candidateSet.contains(segment.fileId()))
+                .mapToInt(SegmentStats::fileId)
+                .min()
+                .orElse(Integer.MAX_VALUE);
 
         long bytesBefore = 0;
         for (int fileId : candidates) {
@@ -391,7 +445,7 @@ public final class Bitcask implements AutoCloseable {
 
         for (int fileId : candidates) {
             for (SourceRecord source : readSegment(fileId)) {
-                long written = copyForwardIfStillNeeded(source, tombstonesKept);
+                long written = copyForwardIfStillNeeded(source, tombstonesKept, oldestSurvivor);
                 if (written > 0) {
                     moved++;
                     bytesWritten += written;
@@ -422,7 +476,8 @@ public final class Bitcask implements AutoCloseable {
      * @return bytes written, or 0 if the record was not worth keeping
      */
     private synchronized long copyForwardIfStillNeeded(SourceRecord source,
-                                                       Set<ByteBuffer> tombstonesKept)
+                                                       Set<ByteBuffer> tombstonesKept,
+                                                       int oldestSurvivor)
             throws IOException {
         LogRecord record = source.record();
         ByteBuffer key = ByteBuffer.wrap(record.key());
@@ -434,8 +489,15 @@ public final class Bitcask implements AutoCloseable {
             if (current != null) {
                 return 0;
             }
-            // Keep exactly one: dropping them all would let an older PUT in an
-            // unmerged segment resurrect the key on the next replay.
+            // Nothing older than this segment survives the merge, so no PUT is
+            // left for the tombstone to cancel and it can finally be dropped.
+            // Without this, deletions would be paid for on every future merge.
+            if (source.fileId() < oldestSurvivor) {
+                return 0;
+            }
+            // An older segment does survive, so keep exactly one copy: dropping
+            // them all would let the PUT still sitting there resurrect the key
+            // on the next replay.
             if (!tombstonesKept.add(ByteBuffer.wrap(Arrays.copyOf(record.key(), record.key().length)))) {
                 return 0;
             }
@@ -545,7 +607,7 @@ public final class Bitcask implements AutoCloseable {
      * <p>Cheap to call: the counts are maintained as writes happen. Use it to
      * decide whether {@link #merge()} is worth running.
      */
-    public CompactionStats compactionStats() throws IOException {
+    public synchronized CompactionStats compactionStats() throws IOException {
         ensureOpen();
 
         List<SegmentStats> segments = new ArrayList<>(channels.size());
