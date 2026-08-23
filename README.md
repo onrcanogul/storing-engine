@@ -17,7 +17,7 @@ written, and the reasoning behind each decision is recorded in
 
 ## Status
 
-**Phase 1 (core) is complete.** 89 tests passing.
+**Phases 1 and 2 are complete.** 124 tests passing.
 
 | | |
 |---|---|
@@ -27,10 +27,11 @@ written, and the reasoning behind each decision is recorded in
 | ✅ | Crash recovery by log replay, with a corruption policy |
 | ✅ | Single-writer enforcement via a directory lock |
 | ✅ | Model-based testing against a reference `HashMap` |
-| ✅ | `kill -9` crash test |
+| ✅ | `kill -9` crash tests, including mid-rotation |
+| ✅ | Segment rotation into immutable closed segments |
 
-Next: segment rotation, compaction, durability tuning, measurement, and
-deliberately breaking it. See [Roadmap](#roadmap).
+Next: compaction, durability tuning, measurement, and deliberately breaking it.
+See [Roadmap](#roadmap).
 
 Not intended for production use.
 
@@ -64,7 +65,21 @@ the engine's.
 
 ### On disk
 
-A log file starts with an 8-byte header, followed by records back to back:
+The store is a directory of segments. The highest-numbered one is active and
+receives every write; the rest are closed and never change again.
+
+```
+data-0000000001.log   closed, fsynced, immutable
+data-0000000002.log   closed, fsynced, immutable
+data-0000000003.log   active — writes land here
+bitcask.lock
+```
+
+There is no metadata file naming the active segment. One could disagree with the
+directory if a crash landed between updating it and creating the segment, with
+no way to tell which was lying, so the listing is the only source of truth.
+
+Each segment starts with an 8-byte header, followed by records back to back:
 
 ```
 ONRC 0001 0000   <record> <record> <record> ...
@@ -102,6 +117,16 @@ Encode the record, append it, **then** update the index. Never the other way
 around: if the write fails, the index must not be left pointing at a record that
 does not exist.
 
+When a record would push the active segment past `maxSegmentSize`, the segment
+is rotated first — records are never split across segments. The outgoing segment
+is fsynced regardless of `SyncPolicy`, which costs one call per segment and buys
+something recovery depends on (see below).
+
+Rotation is crash-safe by construction rather than by repair. Dying before the
+fsync leaves the old segment active; dying after the file is created but before
+its header is written leaves a zero-byte file, which holds no data and is
+repaired on open. Neither state can lose a record.
+
 ### Reading
 
 Look the key up in the index, read the record at that offset, verify the
@@ -117,15 +142,20 @@ loud error, and it costs nothing since the bytes are already in hand.
 On open, the log is replayed from the start; a later record supersedes an
 earlier one, so the physical order in the file is already the correct order.
 
-The interesting part is what happens when a record does not verify:
+The interesting part is what happens when a record does not verify — and here
+segments earn their keep a second time:
 
-| Situation | Cause | Response |
+| Where the damage is | What it means | Response |
 |---|---|---|
-| Damage **at the end** of the log | A write interrupted by a crash — normal and expected | Truncate, report, open |
-| Damage **in the middle** | Bit rot, hardware fault — not normal | Same truncation, but everything after it is lost too |
+| **Active segment** | It was being written and has not been fsynced, so this is the torn tail a crash leaves | Truncate, report, open |
+| **A closed segment** | It was fsynced at rotation, so it is known to have reached the disk. A torn write is impossible here | Always an error, whatever the mode |
 
-The two cannot be told apart with certainty, because the length fields of a
-corrupt record are themselves suspect. So the choice is the application's:
+Phase 1 could not draw that line. With a single file there was no way to tell a
+torn tail from real corruption, because the length fields of a bad record are
+themselves suspect. Rotation makes the distinction structural: only one file can
+possibly hold a torn tail.
+
+For the active segment, the choice is the application's:
 
 - `TOLERATE_TAIL` (default) — truncate the damaged tail and **report exactly
   what was discarded**
@@ -171,11 +201,9 @@ stayed perfectly correct. The value is written and released, so it needs no copy
 ## Configuration
 
 ```java
-new BitcaskConfig(
-    16 * 1024 * 1024,           // maxValueSize
-    SyncPolicy.NEVER,           // NEVER | ALWAYS
-    RecoveryMode.TOLERATE_TAIL  // TOLERATE_TAIL | STRICT
-);
+BitcaskConfig.defaults()
+    .withSyncPolicy(SyncPolicy.ALWAYS)
+    .withMaxSegmentSize(64 * 1024 * 1024);
 ```
 
 | Setting | Default | Notes |
@@ -183,6 +211,7 @@ new BitcaskConfig(
 | `maxValueSize` | 16 MB | Write-side limit only |
 | `syncPolicy` | `NEVER` | `ALWAYS` calls fsync on every write |
 | `recoveryMode` | `TOLERATE_TAIL` | See above |
+| `maxSegmentSize` | 128 MB | Size at which the active segment is rotated |
 
 **On `SyncPolicy`:** `NEVER` still survives `kill -9`, because the OS page cache
 outlives the process. It does not survive power loss. `ALWAYS` survives both, at
@@ -208,11 +237,19 @@ does.
 | CRC is not cryptographic | Detects random corruption, not tampering |
 | No multi-key atomicity | Each operation stands alone |
 | Key ≤ 64 KB, value ≤ 16 MB by default | Format and configuration |
-| Phase 1 only: the log grows without bound | Segment rotation and compaction come next |
+| One open file descriptor per segment | The index points into every segment, so all stay open |
+| Until compaction lands: superseded records are never reclaimed | Phase 3 |
 
 **Measured** at 178 bytes of index memory per key on a 64-bit JVM with 16-byte
 keys — about 1.7 GB for 10 million keys. That is the number to check before
 reaching for this design.
+
+Descriptors are the other resource that scales with the data: every segment is
+held open, so 128 GB at the default segment size needs about 1024 of them. Raise
+`ulimit -n` or use larger segments. Exhaustion produces an error that says so
+rather than a bare `Too many open files`. No channel cache yet — the index
+memory ceiling arrives long before the descriptor one, so whether a cache earns
+its complexity is a question for the measurement phase.
 
 Worth knowing which way the trade-off runs: index cost is independent of value
 size. In that measurement, 200,000 keys holding 100-byte values produced a 27 MB
@@ -228,7 +265,7 @@ ones.
 | Phase | Content |
 |---|---|
 | **1** ✅ | Core: append-only log, in-memory index, crash recovery |
-| 2 | Segment rotation |
+| **2** ✅ | Segment rotation |
 | 3 | Compaction and hint files |
 | 4 | Durability policies: group commit, write buffering |
 | 5 | Measurement: throughput, p99 latency, memory profile |
@@ -263,7 +300,16 @@ replay. The bug is invisible while the engine is running and only appears after
 a restart, which is precisely what a hand-written test tends to miss.
 
 **Crash tests** spawn a writer in its own JVM, `kill -9` it mid-write, and
-verify that every write whose `put` returned is still readable.
+verify that every write whose `put` returned is still readable. A second set
+does the same to a writer rotating segments constantly.
+
+That second set turned up something the first could not. Across twenty runs, the
+interrupted-rotation case — file created, header not yet written — appeared once
+as a real zero-byte segment, the state the unit tests had only simulated.
+Recovery repaired it. Eighteen of the twenty kills landed on a *full* segment,
+because the fsync at rotation dominates everything else: filling a 1 KB segment
+takes roughly 40 µs while its fsync takes 500–1000 µs. How segment size
+interacts with that cost is now a measurement-phase question.
 
 One finding worth recording: **`kill -9` cannot produce a torn record.** A
 syscall already inside the kernel completes before the signal is delivered, so
