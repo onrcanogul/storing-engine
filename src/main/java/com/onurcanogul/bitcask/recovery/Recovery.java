@@ -6,15 +6,19 @@ import com.onurcanogul.bitcask.format.LogRecord;
 import com.onurcanogul.bitcask.format.RecordCodec;
 import com.onurcanogul.bitcask.format.RecordType;
 import com.onurcanogul.bitcask.index.KeyDirEntry;
+import com.onurcanogul.bitcask.store.HintFile;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Rebuilds the in-memory index by replaying every segment in order.
@@ -41,24 +45,46 @@ public final class Recovery {
     }
 
     /**
-     * @param channels open channels for every segment, keyed by file id
-     * @param fileIds  segment ids in ascending order; the last one is active
+     * @param directory where the segments and their hint files live
+     * @param channels  open channels for every segment, keyed by file id
+     * @param fileIds   segment ids in ascending order; the last one is active
      */
-    public static RecoveryResult replay(Map<Integer, FileChannel> channels,
+    public static RecoveryResult replay(Path directory,
+                                        Map<Integer, FileChannel> channels,
                                         List<Integer> fileIds,
                                         Map<ByteBuffer, KeyDirEntry> keyDir,
                                         RecoveryMode mode) throws IOException {
         long recordsReplayed = 0;
         long maxSeq = 0;
+        long segmentsFromHints = 0;
         Map<Integer, Long> deadBytes = new HashMap<>();
 
         int activeFileId = fileIds.get(fileIds.size() - 1);
+        List<HintFile.Entry> activeEntries = new ArrayList<>();
 
         for (int fileId : fileIds) {
             boolean isActive = fileId == activeFileId;
             FileChannel channel = channels.get(fileId);
 
-            ScanResult scan = scanSegment(channel, keyDir, deadBytes, fileId, maxSeq);
+            // A closed segment with a usable hint is loaded without the log being
+            // read at all. The active one never has one: it is still growing, so
+            // no summary of it could be complete.
+            if (!isActive) {
+                Optional<List<HintFile.Entry>> hinted = usableHint(directory, fileId, channel.size(), maxSeq);
+                if (hinted.isPresent()) {
+                    for (HintFile.Entry entry : hinted.get()) {
+                        apply(keyDir, deadBytes, entry.key(), entry.type(), entry.seq(),
+                                fileId, entry.recordPos(), entry.recordSize());
+                        maxSeq = entry.seq();
+                    }
+                    recordsReplayed += hinted.get().size();
+                    segmentsFromHints++;
+                    continue;
+                }
+            }
+
+            ScanResult scan = scanSegment(channel, keyDir, deadBytes, fileId, maxSeq,
+                    isActive ? activeEntries : null);
             recordsReplayed += scan.records();
             maxSeq = scan.maxSeq();
 
@@ -82,16 +108,17 @@ public final class Recovery {
 
             channel.truncate(scan.endOffset());
 
-            RecoveryReport report = new RecoveryReport(
-                    recordsReplayed, keyDir.size(), unreadable, scan.endOffset(), scan.reason());
-            return new RecoveryResult(report, fileId, scan.endOffset(), maxSeq, deadBytes);
+            RecoveryReport report = new RecoveryReport(recordsReplayed, keyDir.size(), unreadable,
+                    scan.endOffset(), scan.reason(), segmentsFromHints);
+            return new RecoveryResult(report, fileId, scan.endOffset(), maxSeq, deadBytes,
+                    activeEntries);
         }
 
         long writePos = channels.get(activeFileId).size();
-        RecoveryReport report = new RecoveryReport(
-                recordsReplayed, keyDir.size(), 0, -1, StopReason.CLEAN_EOF);
+        RecoveryReport report = new RecoveryReport(recordsReplayed, keyDir.size(), 0, -1,
+                StopReason.CLEAN_EOF, segmentsFromHints);
 
-        return new RecoveryResult(report, activeFileId, writePos, maxSeq, deadBytes);
+        return new RecoveryResult(report, activeFileId, writePos, maxSeq, deadBytes, activeEntries);
     }
 
     /** Where a segment scan stopped, and why. */
@@ -99,11 +126,63 @@ public final class Recovery {
                               StopReason reason, String detail) {
     }
 
+    /**
+     * Reads a segment's hint, and vets it before a single entry is applied.
+     *
+     * <p>A hint is a cache, so anything doubtful about it is answered by reading
+     * the log instead. {@link HintFile} has already proved the file is intact and
+     * belongs to this segment; what is left is whether what it says is consistent
+     * with the log it claims to describe. Checking that up front matters: half an
+     * applied hint would leave the index in a state neither file describes.
+     */
+    private static Optional<List<HintFile.Entry>> usableHint(Path directory,
+                                                             int fileId,
+                                                             long segmentBytes,
+                                                             long seqSoFar) throws IOException {
+        Optional<List<HintFile.Entry>> hinted = HintFile.read(directory, fileId, segmentBytes);
+        if (hinted.isEmpty()) {
+            return Optional.empty();
+        }
+
+        long previousSeq = seqSoFar;
+        long expectedPos = FileHeader.SIZE;
+
+        for (HintFile.Entry entry : hinted.get()) {
+            // The same rule the log is held to: sequence numbers only ever go up,
+            // within a segment and across them.
+            if (entry.seq() <= previousSeq) {
+                return Optional.empty();
+            }
+            // Records sit end to end from the header onwards, with no gaps. An
+            // entry pointing anywhere else describes some other file.
+            if (entry.recordPos() != expectedPos || entry.recordSize() <= 0
+                    || entry.recordPos() + entry.recordSize() > segmentBytes) {
+                return Optional.empty();
+            }
+            previousSeq = entry.seq();
+            expectedPos = entry.recordPos() + entry.recordSize();
+        }
+
+        // The hint has to account for the whole segment. Anything left over is a
+        // record it failed to mention, and startup would never learn of it.
+        if (expectedPos != segmentBytes) {
+            return Optional.empty();
+        }
+
+        return hinted;
+    }
+
+    /**
+     * @param entriesOut collects what was found, or null when nobody needs it.
+     *                   Only the active segment does: its records are the start of
+     *                   the hint that will be written when it rotates.
+     */
     private static ScanResult scanSegment(FileChannel channel,
                                           Map<ByteBuffer, KeyDirEntry> keyDir,
                                           Map<Integer, Long> deadBytes,
                                           int fileId,
-                                          long seqSoFar) throws IOException {
+                                          long seqSoFar,
+                                          List<HintFile.Entry> entriesOut) throws IOException {
         long fileSize = channel.size();
         long position = FileHeader.SIZE;
         long records = 0;
@@ -152,7 +231,12 @@ public final class Recovery {
                         "seq " + record.seq() + " does not follow " + maxSeq);
             }
 
-            apply(keyDir, deadBytes, record, fileId, position, size);
+            apply(keyDir, deadBytes, record.key(), record.type(), record.seq(),
+                    fileId, position, size);
+            if (entriesOut != null) {
+                entriesOut.add(new HintFile.Entry(record.seq(), record.type(), position, size,
+                        Arrays.copyOf(record.key(), record.key().length)));
+            }
 
             maxSeq = record.seq();
             records++;
@@ -162,13 +246,21 @@ public final class Recovery {
         return new ScanResult(position, records, maxSeq, StopReason.CLEAN_EOF, null);
     }
 
+    /**
+     * Puts one record into the index, from a log or from a hint.
+     *
+     * <p>Takes the pieces rather than a {@code LogRecord} because a hint has no
+     * value to give: leaving both callers on one path is what makes a hinted
+     * startup and a scanned one produce the same index, garbage counters and all.
+     */
     private static void apply(Map<ByteBuffer, KeyDirEntry> keyDir,
                               Map<Integer, Long> deadBytes,
-                              LogRecord record, int fileId, long position, int size) {
-        ByteBuffer key = ByteBuffer.wrap(Arrays.copyOf(record.key(), record.key().length));
+                              byte[] recordKey, RecordType type, long seq,
+                              int fileId, long position, int size) {
+        ByteBuffer key = ByteBuffer.wrap(Arrays.copyOf(recordKey, recordKey.length));
 
-        KeyDirEntry superseded = (record.type() == RecordType.PUT)
-                ? keyDir.put(key, new KeyDirEntry(fileId, position, size, record.seq()))
+        KeyDirEntry superseded = (type == RecordType.PUT)
+                ? keyDir.put(key, new KeyDirEntry(fileId, position, size, seq))
                 : keyDir.remove(key);
 
         // Whatever this record replaced is now garbage, and it is garbage in

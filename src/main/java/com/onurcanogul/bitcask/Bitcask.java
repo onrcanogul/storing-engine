@@ -13,6 +13,7 @@ import com.onurcanogul.bitcask.recovery.Recovery;
 import com.onurcanogul.bitcask.recovery.RecoveryReport;
 import com.onurcanogul.bitcask.recovery.RecoveryResult;
 import com.onurcanogul.bitcask.store.DirectoryLock;
+import com.onurcanogul.bitcask.store.HintFile;
 import com.onurcanogul.bitcask.store.OpenFileLimit;
 import com.onurcanogul.bitcask.store.SegmentFiles;
 
@@ -66,6 +67,16 @@ public final class Bitcask implements AutoCloseable {
     private final Object mergeLock = new Object();
 
     /**
+     * How many hint entries may be held in memory for one segment.
+     *
+     * <p>A segment is bounded in bytes, not in records, so a store of small
+     * records can hold millions in one file. At roughly eighty bytes an entry
+     * that is heap the caller never asked to spend, so past this point the list
+     * is abandoned and the hint is built by reading the segment at rotation.
+     */
+    private static final int MAX_PENDING_HINT_ENTRIES = 1_000_000;
+
+    /**
      * Called at named points inside a merge. Does nothing unless a test says so.
      *
      * <p>A merge crash cannot be staged from the outside: the interesting moments
@@ -101,6 +112,30 @@ public final class Bitcask implements AutoCloseable {
     private long writePos;
     private long nextSeq;
 
+    /**
+     * The hint entries for the active segment, collected as it is written.
+     *
+     * <p>The writer already knows everything a hint holds — key, offset, length,
+     * sequence number — at the moment it appends a record. Remembering them costs
+     * nothing and spares the segment from being read back at rotation just to
+     * learn what was written into it.
+     *
+     * <p>Guarded by the write lock, like {@code writePos}: both {@code append}
+     * and the merge's own append run under it.
+     */
+    private List<HintFile.Entry> pendingHints;
+
+    /**
+     * Whether {@link #pendingHints} still covers the whole active segment.
+     *
+     * <p>It stops covering it when the segment holds more records than the cap
+     * allows, at which point the list is dropped rather than allowed to grow
+     * without bound. The hint is then built by reading the segment back at
+     * rotation — slower, but a segment that large is exactly the one worth having
+     * a hint for.
+     */
+    private boolean pendingHintsComplete;
+
     private volatile boolean closed;
 
     private Bitcask(Path directory,
@@ -112,7 +147,8 @@ public final class Bitcask implements AutoCloseable {
                     RecoveryReport report,
                     int activeFileId,
                     long writePos,
-                    long nextSeq) {
+                    long nextSeq,
+                    List<HintFile.Entry> activeSegmentEntries) {
         this.deadBytes = new ConcurrentHashMap<>();
         deadBytes.forEach((fileId, bytes) -> this.deadBytes.put(fileId, new AtomicLong(bytes)));
         this.directory = directory;
@@ -125,6 +161,16 @@ public final class Bitcask implements AutoCloseable {
         this.activeChannel = channels.get(activeFileId);
         this.writePos = writePos;
         this.nextSeq = nextSeq;
+
+        // Picking up where the last run left off. A hint written from an empty
+        // list here would describe only this run's writes while claiming the
+        // whole segment, and everything older in it would be lost at the next
+        // startup.
+        this.pendingHints = new ArrayList<>(activeSegmentEntries);
+        this.pendingHintsComplete = activeSegmentEntries.size() <= MAX_PENDING_HINT_ENTRIES;
+        if (!pendingHintsComplete) {
+            pendingHints = new ArrayList<>();
+        }
     }
 
     /**
@@ -157,11 +203,13 @@ public final class Bitcask implements AutoCloseable {
             }
 
             Map<ByteBuffer, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
-            RecoveryResult recovered = Recovery.replay(channels, fileIds, keyDir, config.recoveryMode());
+            RecoveryResult recovered = Recovery.replay(dir, channels, fileIds, keyDir,
+                    config.recoveryMode());
 
             return new Bitcask(dir, config, lock, channels, keyDir, recovered.deadBytes(),
                     recovered.report(), recovered.activeFileId(),
-                    recovered.writePos(), recovered.maxSeq() + 1);
+                    recovered.writePos(), recovered.maxSeq() + 1,
+                    recovered.activeSegmentEntries());
 
         } catch (IOException | RuntimeException e) {
             // A half-finished open must not leave the directory locked forever.
@@ -282,6 +330,7 @@ public final class Bitcask implements AutoCloseable {
         // Disk before memory. In the other order a failed write would leave the
         // index pointing at a record that does not exist.
         indexUpdate.apply(position, size, seq);
+        rememberForHint(seq, type, position, size, key);
 
         // Advanced last, so a failed write leaves no gap in the log.
         writePos = position + size;
@@ -300,6 +349,61 @@ public final class Bitcask implements AutoCloseable {
     }
 
     /**
+     * Notes a record for the hint of the segment being written.
+     *
+     * <p>Gives up rather than growing past the cap: past that point the entries
+     * cost more memory than the hint is worth carrying, and the segment can be
+     * read back at rotation instead.
+     */
+    private void rememberForHint(long seq, RecordType type, long position, int size, byte[] key) {
+        if (!pendingHintsComplete) {
+            return;
+        }
+        if (pendingHints.size() >= MAX_PENDING_HINT_ENTRIES) {
+            pendingHints = new ArrayList<>();
+            pendingHintsComplete = false;
+            return;
+        }
+        pendingHints.add(new HintFile.Entry(seq, type, position, size,
+                Arrays.copyOf(key, key.length)));
+    }
+
+    /**
+     * Writes the hint for the segment that has just stopped taking writes.
+     *
+     * <p>A failure here is not allowed to fail the rotation. The hint is a cache:
+     * without it the next startup reads this segment's log, which is what every
+     * startup did before hints existed.
+     */
+    private void writeHintForClosedSegment(int fileId) {
+        try {
+            long segmentBytes = channels.get(fileId).size();
+            List<HintFile.Entry> entries = pendingHintsComplete
+                    ? pendingHints
+                    : entriesByReading(fileId);
+
+            HintFile.write(directory, fileId, entries, segmentBytes);
+        } catch (IOException doNotFailTheWriteOverACache) {
+            // Nothing to do but carry on. Startup will scan this segment.
+        } finally {
+            pendingHints = new ArrayList<>();
+            pendingHintsComplete = true;
+        }
+    }
+
+    /** Rebuilds a segment's hint entries by reading it, when memory could not hold them. */
+    private List<HintFile.Entry> entriesByReading(int fileId) throws IOException {
+        List<HintFile.Entry> entries = new ArrayList<>();
+        for (SourceRecord source : readSegment(fileId)) {
+            LogRecord record = source.record();
+            entries.add(new HintFile.Entry(record.seq(), record.type(),
+                    source.position(), source.size(),
+                    Arrays.copyOf(record.key(), record.key().length)));
+        }
+        return entries;
+    }
+
+    /**
      * Closes the active segment to further writes and starts the next one.
      *
      * <p>The outgoing segment is fsynced regardless of {@link SyncPolicy}. It
@@ -312,6 +416,10 @@ public final class Bitcask implements AutoCloseable {
      */
     private void rotate() throws IOException {
         forceActive();
+
+        // Only now, with the segment on the disk. A hint that reached the disk
+        // first would, after a power failure, point at records that never made it.
+        writeHintForClosedSegment(activeFileId);
 
         int newFileId = activeFileId + 1;
         // CREATE_NEW rather than CREATE: if that file somehow exists, something
@@ -614,6 +722,7 @@ public final class Bitcask implements AutoCloseable {
         if (indexKey != null) {
             keyDir.put(indexKeyCopyOf(key), new KeyDirEntry(activeFileId, position, size, seq));
         }
+        rememberForHint(seq, type, position, size, key);
 
         writePos = position + size;
         nextSeq = seq + 1;
@@ -656,6 +765,10 @@ public final class Bitcask implements AutoCloseable {
             channel.close();
         }
         Files.deleteIfExists(SegmentFiles.pathOf(directory, fileId));
+
+        // A hint outliving its segment would describe a file that no longer
+        // exists, and the id it carries could later be handed to a new segment.
+        HintFile.delete(directory, fileId);
     }
 
     /**

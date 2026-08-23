@@ -43,6 +43,9 @@ public final class SegmentFiles {
 
     private static final String PREFIX = "data-";
     private static final String SUFFIX = ".log";
+    private static final String HINT_PREFIX = "hint-";
+    private static final String HINT_SUFFIX = ".idx";
+    private static final String TEMP_SUFFIX = ".tmp";
     private static final int DIGITS = 10;
 
     private static final Pattern SEGMENT_NAME =
@@ -57,6 +60,22 @@ public final class SegmentFiles {
 
     public static Path pathOf(Path dir, int fileId) {
         return dir.resolve(fileName(fileId));
+    }
+
+    /**
+     * Where a segment's hint file lives: beside it, same number, different name.
+     *
+     * <p>Not matched by {@link #SEGMENT_NAME}, so hint files are invisible to
+     * segment discovery. A directory listing stays the source of truth about
+     * which segments exist, and hints cannot vote.
+     */
+    public static Path hintPathOf(Path dir, int fileId) {
+        return dir.resolve(HINT_PREFIX + String.format("%0" + DIGITS + "d", fileId) + HINT_SUFFIX);
+    }
+
+    /** Where a hint is built before it is moved into place. */
+    public static Path hintTempPathOf(Path dir, int fileId) {
+        return dir.resolve(hintPathOf(dir, fileId).getFileName() + TEMP_SUFFIX);
     }
 
     /** @return the file id, or empty if the name is not a segment name */
