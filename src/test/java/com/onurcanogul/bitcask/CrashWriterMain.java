@@ -20,6 +20,11 @@ public final class CrashWriterMain {
         SyncPolicy syncPolicy = SyncPolicy.valueOf(args[1]);
 
         BitcaskConfig config = BitcaskConfig.defaults().withSyncPolicy(syncPolicy);
+        if (args.length > 2) {
+            // A small segment makes rotation frequent, so the kill is likely to
+            // land in the middle of one.
+            config = config.withMaxValueSize(64).withMaxSegmentSize(Integer.parseInt(args[2]));
+        }
 
         // Deliberately not in try-with-resources: this process is meant to die
         // without ever closing the engine.
