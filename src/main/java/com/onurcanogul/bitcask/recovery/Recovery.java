@@ -12,6 +12,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -49,6 +50,7 @@ public final class Recovery {
                                         RecoveryMode mode) throws IOException {
         long recordsReplayed = 0;
         long maxSeq = 0;
+        Map<Integer, Long> deadBytes = new HashMap<>();
 
         int activeFileId = fileIds.get(fileIds.size() - 1);
 
@@ -56,7 +58,7 @@ public final class Recovery {
             boolean isActive = fileId == activeFileId;
             FileChannel channel = channels.get(fileId);
 
-            ScanResult scan = scanSegment(channel, keyDir, fileId, maxSeq);
+            ScanResult scan = scanSegment(channel, keyDir, deadBytes, fileId, maxSeq);
             recordsReplayed += scan.records();
             maxSeq = scan.maxSeq();
 
@@ -82,14 +84,14 @@ public final class Recovery {
 
             RecoveryReport report = new RecoveryReport(
                     recordsReplayed, keyDir.size(), unreadable, scan.endOffset(), scan.reason());
-            return new RecoveryResult(report, fileId, scan.endOffset(), maxSeq);
+            return new RecoveryResult(report, fileId, scan.endOffset(), maxSeq, deadBytes);
         }
 
         long writePos = channels.get(activeFileId).size();
         RecoveryReport report = new RecoveryReport(
                 recordsReplayed, keyDir.size(), 0, -1, StopReason.CLEAN_EOF);
 
-        return new RecoveryResult(report, activeFileId, writePos, maxSeq);
+        return new RecoveryResult(report, activeFileId, writePos, maxSeq, deadBytes);
     }
 
     /** Where a segment scan stopped, and why. */
@@ -99,6 +101,7 @@ public final class Recovery {
 
     private static ScanResult scanSegment(FileChannel channel,
                                           Map<ByteBuffer, KeyDirEntry> keyDir,
+                                          Map<Integer, Long> deadBytes,
                                           int fileId,
                                           long seqSoFar) throws IOException {
         long fileSize = channel.size();
@@ -149,7 +152,7 @@ public final class Recovery {
                         "seq " + record.seq() + " does not follow " + maxSeq);
             }
 
-            apply(keyDir, record, fileId, position, size);
+            apply(keyDir, deadBytes, record, fileId, position, size);
 
             maxSeq = record.seq();
             records++;
@@ -159,14 +162,19 @@ public final class Recovery {
         return new ScanResult(position, records, maxSeq, StopReason.CLEAN_EOF, null);
     }
 
-    private static void apply(Map<ByteBuffer, KeyDirEntry> keyDir, LogRecord record,
-                              int fileId, long position, int size) {
+    private static void apply(Map<ByteBuffer, KeyDirEntry> keyDir,
+                              Map<Integer, Long> deadBytes,
+                              LogRecord record, int fileId, long position, int size) {
         ByteBuffer key = ByteBuffer.wrap(Arrays.copyOf(record.key(), record.key().length));
 
-        if (record.type() == RecordType.PUT) {
-            keyDir.put(key, new KeyDirEntry(fileId, position, size, record.seq()));
-        } else {
-            keyDir.remove(key);
+        KeyDirEntry superseded = (record.type() == RecordType.PUT)
+                ? keyDir.put(key, new KeyDirEntry(fileId, position, size, record.seq()))
+                : keyDir.remove(key);
+
+        // Whatever this record replaced is now garbage, and it is garbage in
+        // whichever segment happens to hold it.
+        if (superseded != null) {
+            deadBytes.merge(superseded.fileId(), (long) superseded.recordSize(), Long::sum);
         }
     }
 

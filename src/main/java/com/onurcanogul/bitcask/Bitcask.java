@@ -1,5 +1,7 @@
 package com.onurcanogul.bitcask;
 
+import com.onurcanogul.bitcask.compaction.CompactionStats;
+import com.onurcanogul.bitcask.compaction.SegmentStats;
 import com.onurcanogul.bitcask.format.FileHeader;
 import com.onurcanogul.bitcask.format.FormatLimits;
 import com.onurcanogul.bitcask.format.LogRecord;
@@ -24,6 +26,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -50,6 +53,15 @@ public final class Bitcask implements AutoCloseable {
     /** Every segment stays open: the index points into all of them. */
     private final Map<Integer, FileChannel> channels;
 
+    /**
+     * Bytes per segment held by records that have since been superseded.
+     *
+     * <p>Counted as writes happen rather than computed on demand: working it out
+     * from the index would cost a pass over every key, and keys are the one thing
+     * this engine has in quantity.
+     */
+    private final Map<Integer, AtomicLong> deadBytes;
+
     private int activeFileId;
     private FileChannel activeChannel;
     private long writePos;
@@ -62,10 +74,13 @@ public final class Bitcask implements AutoCloseable {
                     DirectoryLock lock,
                     Map<Integer, FileChannel> channels,
                     Map<ByteBuffer, KeyDirEntry> keyDir,
+                    Map<Integer, Long> deadBytes,
                     RecoveryReport report,
                     int activeFileId,
                     long writePos,
                     long nextSeq) {
+        this.deadBytes = new ConcurrentHashMap<>();
+        deadBytes.forEach((fileId, bytes) -> this.deadBytes.put(fileId, new AtomicLong(bytes)));
         this.directory = directory;
         this.config = config;
         this.lock = lock;
@@ -110,8 +125,9 @@ public final class Bitcask implements AutoCloseable {
             Map<ByteBuffer, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
             RecoveryResult recovered = Recovery.replay(channels, fileIds, keyDir, config.recoveryMode());
 
-            return new Bitcask(dir, config, lock, channels, keyDir, recovered.report(),
-                    recovered.activeFileId(), recovered.writePos(), recovered.maxSeq() + 1);
+            return new Bitcask(dir, config, lock, channels, keyDir, recovered.deadBytes(),
+                    recovered.report(), recovered.activeFileId(),
+                    recovered.writePos(), recovered.maxSeq() + 1);
 
         } catch (IOException | RuntimeException e) {
             // A half-finished open must not leave the directory locked forever.
@@ -168,8 +184,8 @@ public final class Bitcask implements AutoCloseable {
         }
 
         append(RecordType.PUT, key, storedValue,
-                (position, size, seq) -> keyDir.put(indexKeyCopyOf(key),
-                        new KeyDirEntry(activeFileId, position, size, seq)));
+                (position, size, seq) -> recordSuperseded(keyDir.put(indexKeyCopyOf(key),
+                        new KeyDirEntry(activeFileId, position, size, seq))));
     }
 
     /**
@@ -193,7 +209,7 @@ public final class Bitcask implements AutoCloseable {
         }
 
         append(RecordType.TOMBSTONE, key, new byte[0],
-                (position, size, seq) -> keyDir.remove(lookupKey));
+                (position, size, seq) -> recordSuperseded(keyDir.remove(lookupKey)));
         return true;
     }
 
@@ -316,6 +332,45 @@ public final class Bitcask implements AutoCloseable {
         }
 
         return record.value();
+    }
+
+    /**
+     * Notes that {@code superseded} is now garbage, in whichever segment holds it.
+     *
+     * <p>The tombstone or newer record that displaced it is not counted here: it
+     * is still live as far as the index is concerned, and a tombstone still has
+     * work to do until compaction can prove otherwise.
+     */
+    private void recordSuperseded(KeyDirEntry superseded) {
+        if (superseded == null) {
+            return;
+        }
+        deadBytes.computeIfAbsent(superseded.fileId(), id -> new AtomicLong())
+                .addAndGet(superseded.recordSize());
+    }
+
+    /**
+     * How much of the store is garbage, segment by segment.
+     *
+     * <p>Cheap to call: the counts are maintained as writes happen. Use it to
+     * decide whether {@link #merge()} is worth running.
+     */
+    public CompactionStats compactionStats() throws IOException {
+        ensureOpen();
+
+        List<SegmentStats> segments = new ArrayList<>(channels.size());
+        for (Map.Entry<Integer, FileChannel> entry : channels.entrySet()) {
+            int fileId = entry.getKey();
+            AtomicLong dead = deadBytes.get(fileId);
+
+            segments.add(new SegmentStats(
+                    fileId,
+                    entry.getValue().size(),
+                    dead == null ? 0L : dead.get(),
+                    fileId == activeFileId));
+        }
+        segments.sort(java.util.Comparator.comparingInt(SegmentStats::fileId));
+        return new CompactionStats(segments);
     }
 
     /** What the last recovery found. Never null. */
