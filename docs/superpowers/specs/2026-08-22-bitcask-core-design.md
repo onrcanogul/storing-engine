@@ -621,7 +621,14 @@ reasoning that should be confirmed with numbers.
    warranted.
 4. **fsync `NEVER` vs `ALWAYS`.** Measure the expected 50–100× throughput gap
    directly.
-5. **GC behavior with large values.** G1GC treats objects larger than half a
+5. **Is a channel cache worth it?** Every segment is held open, so descriptor
+   use grows with the data — 1024 segments at 128 MB is about 128 GB. An LRU
+   channel cache would cap that, at the cost of locking on the read path and a
+   reopen-and-retry path when a channel is evicted mid-read. Measure first
+   whether the limit is ever reached before the index memory ceiling, which
+   arrives much earlier: 128 GB of 1 KB values is 128 million keys, or roughly
+   23 GB of index.
+6. **GC behavior with large values.** G1GC treats objects larger than half a
    region (regions are 1–32 MB, chosen automatically) as *humongous
    allocations*: they bypass young-generation handling, go straight to old gen,
    fragment the heap, and can trigger concurrent cycles. With a 16 MB value

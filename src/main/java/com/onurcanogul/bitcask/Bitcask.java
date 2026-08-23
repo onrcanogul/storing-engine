@@ -10,6 +10,7 @@ import com.onurcanogul.bitcask.recovery.Recovery;
 import com.onurcanogul.bitcask.recovery.RecoveryReport;
 import com.onurcanogul.bitcask.recovery.RecoveryResult;
 import com.onurcanogul.bitcask.store.DirectoryLock;
+import com.onurcanogul.bitcask.store.OpenFileLimit;
 import com.onurcanogul.bitcask.store.SegmentFiles;
 
 import java.io.IOException;
@@ -99,7 +100,11 @@ public final class Bitcask implements AutoCloseable {
             }
 
             for (int fileId : fileIds) {
-                channels.put(fileId, openSegment(dir, fileId));
+                try {
+                    channels.put(fileId, openSegment(dir, fileId));
+                } catch (IOException e) {
+                    throw OpenFileLimit.describe(e, channels.size());
+                }
             }
 
             Map<ByteBuffer, KeyDirEntry> keyDir = new ConcurrentHashMap<>();
@@ -250,8 +255,14 @@ public final class Bitcask implements AutoCloseable {
         int newFileId = activeFileId + 1;
         // CREATE_NEW rather than CREATE: if that file somehow exists, something
         // is badly wrong and overwriting it would destroy records.
-        FileChannel newChannel = FileChannel.open(SegmentFiles.pathOf(directory, newFileId),
-                StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        FileChannel newChannel;
+        try {
+            newChannel = FileChannel.open(SegmentFiles.pathOf(directory, newFileId),
+                    StandardOpenOption.CREATE_NEW, StandardOpenOption.READ, StandardOpenOption.WRITE);
+        } catch (IOException e) {
+            // A long-running store runs out of descriptors here rather than at open.
+            throw OpenFileLimit.describe(e, channels.size());
+        }
         FileHeader.write(newChannel);
 
         channels.put(newFileId, newChannel);
