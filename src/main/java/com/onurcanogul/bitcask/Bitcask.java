@@ -71,6 +71,33 @@ public final class Bitcask implements AutoCloseable {
     private final HintWriter hintWriter;
 
     /**
+     * How many records a merge carries forward per acquisition of the write lock.
+     *
+     * <p>Taking the lock once per record loses to a writer that never pauses.
+     * {@code synchronized} makes no fairness promise, and the thread that just
+     * released a lock is the one still running, so it usually takes it straight
+     * back. Measured, the merge got a turn about once per rotation the writer
+     * performed — a few hundred records a second — which is not compaction
+     * keeping up, it is compaction losing slowly.
+     *
+     * <p>Batching does not change how often the merge wins the lock. It changes
+     * how far it gets each time.
+     *
+     * <p>Swept against a writer that never pauses, merging 2,000 live records out
+     * of 8,000: 20.2 s at a batch of 1, 4.9 s at 8, 3.6 s at 64, 3.4 s at 512.
+     * Sixty-four sits at the knee — past it the gain is single digits while the
+     * lock is held far longer.
+     *
+     * <p>The cost this was expected to have did not appear. The writer's latency
+     * was unchanged across the whole sweep (p99 within 5,075 µs and 4,714 µs, and
+     * moving the wrong way for batching to explain it), because what dominates a
+     * writer's tail is its own rotation, not waiting for a merge. That may not
+     * hold on a machine where rotations are rarer, which is the reason to stay at
+     * the knee rather than take the last 6%.
+     */
+    private static final int MERGE_BATCH_RECORDS = 64;
+
+    /**
      * How many hint entries may be held in memory for one segment.
      *
      * <p>A segment is bounded in bytes, not in records, so a store of small
@@ -598,15 +625,18 @@ public final class Bitcask implements AutoCloseable {
         Set<ByteBuffer> tombstonesKept = new HashSet<>();
 
         for (int fileId : candidates) {
-            for (SourceRecord source : readSegment(fileId)) {
-                long written = copyForwardIfStillNeeded(source, tombstonesKept, oldestSurvivor);
-                if (written > 0) {
-                    moved++;
-                    bytesWritten += written;
-                    mergeHook.accept(MergeHookPoint.MID_COPY);
-                } else {
-                    discarded++;
-                }
+            // Read outside the lock, then hand the records over in batches. The
+            // reading was never the contended part; the deciding and copying are.
+            List<SourceRecord> records = readSegment(fileId);
+
+            for (int from = 0; from < records.size(); from += MERGE_BATCH_RECORDS) {
+                int to = Math.min(from + MERGE_BATCH_RECORDS, records.size());
+                Tally tally = copyBatchForward(records.subList(from, to),
+                        tombstonesKept, oldestSurvivor);
+
+                moved += tally.moved();
+                discarded += tally.discarded();
+                bytesWritten += tally.bytesWritten();
             }
         }
 
@@ -660,16 +690,48 @@ public final class Bitcask implements AutoCloseable {
     private record SourceRecord(int fileId, long position, int size, LogRecord record) {
     }
 
+    /** What one batch of the merge managed to do. */
+    private record Tally(long moved, long discarded, long bytesWritten) {
+    }
+
+    /**
+     * Carries a batch of records forward under one acquisition of the write lock.
+     *
+     * <p>The lock has to cover the liveness check and the copy together — a
+     * competing {@code put} landing between them would make the record stale and
+     * copying it anyway would resurrect an old value. Covering a whole batch is
+     * the same guarantee, held for longer.
+     */
+    private synchronized Tally copyBatchForward(List<SourceRecord> batch,
+                                                Set<ByteBuffer> tombstonesKept,
+                                                int oldestSurvivor)
+            throws IOException {
+        long moved = 0;
+        long discarded = 0;
+        long bytesWritten = 0;
+
+        for (SourceRecord source : batch) {
+            long written = copyForwardIfStillNeeded(source, tombstonesKept, oldestSurvivor);
+            if (written > 0) {
+                moved++;
+                bytesWritten += written;
+                mergeHook.accept(MergeHookPoint.MID_COPY);
+            } else {
+                discarded++;
+            }
+        }
+
+        return new Tally(moved, discarded, bytesWritten);
+    }
+
     /**
      * Copies a record forward if the index still needs it.
      *
-     * <p>Synchronized against the writer: the liveness check and the write that
-     * follows it have to be one step. Between them, a competing {@code put} could
-     * make this record stale, and copying it anyway would resurrect an old value.
+     * <p>Called with the write lock held, by {@link #copyBatchForward}.
      *
      * @return bytes written, or 0 if the record was not worth keeping
      */
-    private synchronized long copyForwardIfStillNeeded(SourceRecord source,
+    private long copyForwardIfStillNeeded(SourceRecord source,
                                                        Set<ByteBuffer> tombstonesKept,
                                                        int oldestSurvivor)
             throws IOException {
