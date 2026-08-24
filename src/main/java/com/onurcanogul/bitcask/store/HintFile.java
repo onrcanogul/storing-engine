@@ -44,6 +44,10 @@ import java.util.zip.CRC32C;
  * rejected. Partial recovery would be pointless work for a file that can be
  * rebuilt.
  *
+ * <p>That validation is also what lets a hint be written without an fsync:
+ * nothing in it has to survive a crash, only to be recognisable as damaged if
+ * it does not.
+ *
  * <p>Internal to the engine.
  */
 public final class HintFile {
@@ -80,6 +84,14 @@ public final class HintFile {
      * <p>Built in a temporary file and moved into place, so a crash midway
      * through cannot leave a half-written hint under the name that startup
      * trusts. The move is the moment the hint begins to exist.
+     *
+     * <p><strong>Deliberately not fsynced.</strong> A hint whose contents did not
+     * survive a power failure fails the checks in {@link #read} and is thrown
+     * away — the same outcome as a hint that was never written, and the same
+     * cost: that one segment's log is read instead. An fsync here would defend
+     * against a failure the validation already handles, and it is not free. It
+     * queues in the filesystem journal behind every other thread's writes, which
+     * was measured making ordinary puts five times slower.
      *
      * <p>The caller must have fsynced the segment first. A hint that reaches the
      * disk before the records it describes would, after a power failure, point
@@ -122,7 +134,6 @@ public final class HintFile {
             while (buf.hasRemaining()) {
                 channel.write(buf);
             }
-            channel.force(false);
         }
 
         move(temp, target);

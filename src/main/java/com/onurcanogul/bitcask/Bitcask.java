@@ -14,6 +14,7 @@ import com.onurcanogul.bitcask.recovery.RecoveryReport;
 import com.onurcanogul.bitcask.recovery.RecoveryResult;
 import com.onurcanogul.bitcask.store.DirectoryLock;
 import com.onurcanogul.bitcask.store.HintFile;
+import com.onurcanogul.bitcask.store.HintWriter;
 import com.onurcanogul.bitcask.store.OpenFileLimit;
 import com.onurcanogul.bitcask.store.SegmentFiles;
 
@@ -65,6 +66,9 @@ public final class Bitcask implements AutoCloseable {
 
     /** Serialises merges against each other without blocking ordinary writes. */
     private final Object mergeLock = new Object();
+
+    /** Writes hint files off the write lock, since nothing waits on a cache. */
+    private final HintWriter hintWriter;
 
     /**
      * How many hint entries may be held in memory for one segment.
@@ -152,6 +156,7 @@ public final class Bitcask implements AutoCloseable {
         this.deadBytes = new ConcurrentHashMap<>();
         deadBytes.forEach((fileId, bytes) -> this.deadBytes.put(fileId, new AtomicLong(bytes)));
         this.directory = directory;
+        this.hintWriter = new HintWriter(directory);
         this.config = config;
         this.lock = lock;
         this.channels = channels;
@@ -369,23 +374,31 @@ public final class Bitcask implements AutoCloseable {
     }
 
     /**
-     * Writes the hint for the segment that has just stopped taking writes.
+     * Hands the hint for the segment that has just stopped taking writes to the
+     * background writer.
      *
-     * <p>A failure here is not allowed to fail the rotation. The hint is a cache:
-     * without it the next startup reads this segment's log, which is what every
-     * startup did before hints existed.
+     * <p>Everything expensive about a hint — building the file, fsyncing it,
+     * moving it into place — happens on the other side of this call, because the
+     * write lock is held here and no writer should wait on a cache.
+     *
+     * <p>{@code writePos} rather than the file's length: they are the same number
+     * and one of them is a syscall.
+     *
+     * <p>A failure is not allowed to fail the rotation. Without a hint the next
+     * startup reads this segment's log, which is what every startup did before
+     * hints existed.
      */
-    private void writeHintForClosedSegment(int fileId) {
+    private void handOverHintFor(int fileId) {
         try {
-            long segmentBytes = channels.get(fileId).size();
             List<HintFile.Entry> entries = pendingHintsComplete
                     ? pendingHints
                     : entriesByReading(fileId);
 
-            HintFile.write(directory, fileId, entries, segmentBytes);
+            hintWriter.submit(fileId, entries, writePos);
         } catch (IOException doNotFailTheWriteOverACache) {
-            // Nothing to do but carry on. Startup will scan this segment.
+            // Only reachable on the rebuild-by-reading path. Carry on.
         } finally {
+            // A fresh list either way: the old one now belongs to the writer.
             pendingHints = new ArrayList<>();
             pendingHintsComplete = true;
         }
@@ -417,9 +430,10 @@ public final class Bitcask implements AutoCloseable {
     private void rotate() throws IOException {
         forceActive();
 
-        // Only now, with the segment on the disk. A hint that reached the disk
-        // first would, after a power failure, point at records that never made it.
-        writeHintForClosedSegment(activeFileId);
+        // Only now, with the segment on the disk: a hint that reached the disk
+        // first would, after a power failure, point at records that never made
+        // it. Handed over rather than written here — see HintWriter.
+        handOverHintFor(activeFileId);
 
         int newFileId = activeFileId + 1;
         // CREATE_NEW rather than CREATE: if that file somehow exists, something
@@ -834,6 +848,10 @@ public final class Bitcask implements AutoCloseable {
         }
         closed = true;
         try {
+            // Before the channels go: a clean shutdown keeps the hints it has
+            // already built, so the next startup is the fast one.
+            hintWriter.close();
+
             for (FileChannel channel : channels.values()) {
                 channel.close();
             }

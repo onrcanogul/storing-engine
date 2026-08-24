@@ -458,5 +458,7 @@ Java 21, Maven. No third-party runtime dependencies; JUnit 5 for tests only.
 
 - [Design spec](docs/superpowers/specs/2026-08-22-bitcask-core-design.md) — every
   decision, with the reasoning and the alternatives that were rejected
+- [Measurements](docs/measurements/) — what was measured, what it predicted, and
+  where the prediction was wrong
 - [Implementation plan](docs/superpowers/plans/2026-08-22-bitcask-core.md) —
   task-by-task breakdown

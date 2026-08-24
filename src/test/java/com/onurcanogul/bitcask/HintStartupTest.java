@@ -203,6 +203,38 @@ class HintStartupTest {
         }
     }
 
+    /**
+     * Hints are built by a background writer, so at the moment {@code close()} is
+     * called there may be a backlog of them still unwritten. A clean shutdown has
+     * to finish that work.
+     *
+     * <p>Losing it would cost nothing but speed — the next startup would read
+     * those logs — which is exactly why it would go unnoticed without a test
+     * saying so. The burst here is what makes the backlog certain: rotations
+     * arrive microseconds apart while a hint takes milliseconds to write.
+     */
+    @Test
+    void aBacklogOfHintsIsWrittenBeforeCloseReturns() throws Exception {
+        try (Bitcask db = Bitcask.open(dir, config())) {
+            for (int i = 0; i < 500; i++) {
+                db.put(key(i), b("v:" + i));
+            }
+        }
+
+        List<Integer> fileIds = SegmentFiles.listFileIds(dir);
+        int active = fileIds.get(fileIds.size() - 1);
+        assertTrue(fileIds.size() > 20, "not enough rotations to build a backlog: " + fileIds.size());
+
+        for (int fileId : fileIds) {
+            if (fileId == active) {
+                continue;
+            }
+            assertTrue(Files.isRegularFile(SegmentFiles.hintPathOf(dir, fileId)),
+                    "segment " + fileId + " closed without its hint being written: "
+                            + "close() returned while the writer still had a backlog");
+        }
+    }
+
     @Test
     void aTemporaryHintLeftBehindByACrashIsIgnored() throws Exception {
         fillAndClose();
