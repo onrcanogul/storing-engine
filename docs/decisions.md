@@ -192,6 +192,33 @@ device to confirm. Moving the call changes which thread waits, not how long the
 wait is — the serialisation is below the application, in the filesystem journal
 and the device. Hence the rule below.
 
+### Writers share one fsync
+
+Under `SyncPolicy.ALWAYS` every write bought its own trip to the disk, because
+the fsync happened inside the write lock — no other write could even be appended
+during it. Throughput was flat at 353/sec however many threads wrote, and the tail
+grew with concurrency: p99.9 of 211 ms at eight threads, each writer waiting
+behind everyone else's private fsync.
+
+`put` now appends under the lock, releases it, and waits outside. The first waiter
+performs the fsync and everyone appended before it began is released together.
+
+At eight threads: 4.8x the throughput and a 15x better p99. Throughput and tail
+improved together, which almost never happens, and nothing was traded — **the
+promise is unchanged.** `put` still returns only once its own record is on the
+disk.
+
+**Turned down for now:** `INTERVAL`, where an fsync happens on a timer and `put`
+does not wait at all. That is a different promise — "you may lose the last N
+milliseconds" — and it should be a deliberate choice by the caller rather than
+something smuggled in beside a change that keeps the existing one.
+
+**What this taught:** fsyncs per second did not move. About 370, before and
+after, in every row. That is the device's rate, and no arrangement of threads
+changes it. All that can be changed is how many writes ride along with each one —
+which is exactly why the two earlier attempts in this phase failed, since moving
+an fsync leaves the count alone.
+
 ---
 
 ## What the phases taught, in general
@@ -205,7 +232,8 @@ calls, not killing the process.
 cost that looked like lock contention was somewhere else: twice in the filesystem
 journal, once in an fsync the lock happened to be wrapped around.
 
-**Moving an fsync never helps.** It is a wait for hardware, serialised beneath the
+**There are two levers, and only one of them was ever going to work.** Moving an
+fsync never helps. It is a wait for hardware, serialised beneath the
 application, so handing it to another thread only changes who waits. Two things
 help and nothing else does: not doing it, when what it protects is already
 protected some other way; and doing it less often, since the cost is per

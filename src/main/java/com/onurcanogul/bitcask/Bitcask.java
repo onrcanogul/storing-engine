@@ -70,6 +70,9 @@ public final class Bitcask implements AutoCloseable {
     /** Writes hint files off the write lock, since nothing waits on a cache. */
     private final HintWriter hintWriter;
 
+    /** Lets writers waiting under {@link SyncPolicy#ALWAYS} share one fsync. */
+    private final GroupCommit groupCommit = new GroupCommit(this::syncForDurability);
+
     /**
      * How many records a merge carries forward per acquisition of the write lock.
      *
@@ -287,7 +290,7 @@ public final class Bitcask implements AutoCloseable {
      *
      * @throws IllegalArgumentException if the key is empty or either side is over its limit
      */
-    public synchronized void put(byte[] key, byte[] value) throws IOException {
+    public void put(byte[] key, byte[] value) throws IOException {
         ensureOpen();
         validateKey(key);
 
@@ -297,9 +300,18 @@ public final class Bitcask implements AutoCloseable {
                     "value too large: " + storedValue.length + " > " + config.maxValueSize());
         }
 
-        append(RecordType.PUT, key, storedValue,
-                (position, size, seq) -> recordSuperseded(keyDir.put(indexKeyCopyOf(key),
-                        new KeyDirEntry(activeFileId, position, size, seq))));
+        long seq;
+        synchronized (this) {
+            ensureOpen();
+            seq = append(RecordType.PUT, key, storedValue,
+                    (position, size, recordSeq) -> recordSuperseded(keyDir.put(indexKeyCopyOf(key),
+                            new KeyDirEntry(activeFileId, position, size, recordSeq))));
+        }
+
+        // Outside the lock. Waiting here rather than inside is the whole point:
+        // it is what lets the next writer append while this one waits, and what
+        // lets both of them ride the same fsync.
+        awaitDurable(seq);
     }
 
     /**
@@ -312,18 +324,25 @@ public final class Bitcask implements AutoCloseable {
      *
      * @return true if the key was present and is now gone
      */
-    public synchronized boolean delete(byte[] key) throws IOException {
+    public boolean delete(byte[] key) throws IOException {
         ensureOpen();
         validateKey(key);
 
         ByteBuffer lookupKey = ByteBuffer.wrap(key);
-        if (!keyDir.containsKey(lookupKey)) {
-            // Nothing to cancel, so a tombstone here would be pure garbage.
-            return false;
+        long seq;
+
+        synchronized (this) {
+            ensureOpen();
+            if (!keyDir.containsKey(lookupKey)) {
+                // Nothing to cancel, so a tombstone here would be pure garbage.
+                return false;
+            }
+
+            seq = append(RecordType.TOMBSTONE, key, new byte[0],
+                    (position, size, recordSeq) -> recordSuperseded(keyDir.remove(lookupKey)));
         }
 
-        append(RecordType.TOMBSTONE, key, new byte[0],
-                (position, size, seq) -> recordSuperseded(keyDir.remove(lookupKey)));
+        awaitDurable(seq);
         return true;
     }
 
@@ -333,7 +352,7 @@ public final class Bitcask implements AutoCloseable {
         void apply(long position, int size, long seq);
     }
 
-    private void append(RecordType type, byte[] key, byte[] value, IndexUpdate indexUpdate)
+    private long append(RecordType type, byte[] key, byte[] value, IndexUpdate indexUpdate)
             throws IOException {
         int size = RecordCodec.recordSize(key.length, value.length);
 
@@ -355,9 +374,10 @@ public final class Bitcask implements AutoCloseable {
         long position = writePos;
 
         writeFully(record, position);
-        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            forceActive();
-        }
+
+        // No fsync here, not even under ALWAYS. The caller waits for one outside
+        // the lock instead, so that other writers can append in the meantime and
+        // share it. See GroupCommit.
 
         // Disk before memory. In the other order a failed write would leave the
         // index pointing at a record that does not exist.
@@ -367,6 +387,49 @@ public final class Bitcask implements AutoCloseable {
         // Advanced last, so a failed write leaves no gap in the log.
         writePos = position + size;
         nextSeq = seq + 1;
+        return seq;
+    }
+
+    /**
+     * Waits until the record with this sequence number is on the disk.
+     *
+     * <p>Does nothing unless the caller asked for {@link SyncPolicy#ALWAYS}. Under
+     * {@code NEVER} the engine promises nothing about power loss, so there is
+     * nothing to wait for.
+     */
+    private void awaitDurable(long seq) throws IOException {
+        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
+            groupCommit.awaitDurable(seq);
+        }
+    }
+
+    /**
+     * Performs one fsync on behalf of everyone waiting.
+     *
+     * <p>The target is read under the write lock and the fsync happens outside
+     * it, which is what lets writers keep appending during it. Those later records
+     * have higher sequence numbers than the target, so they are not claimed by it.
+     *
+     * <p>A rotation slipping in between the two would leave this forcing a segment
+     * that is no longer the active one — harmless, because rotation fsyncs the
+     * segment it closes anyway. Everything up to the target is on the disk either
+     * way.
+     *
+     * @return the highest sequence number now on the disk
+     */
+    private long syncForDurability() throws IOException {
+        FileChannel channel;
+        long target;
+
+        synchronized (this) {
+            ensureOpen();
+            channel = activeChannel;
+            target = nextSeq - 1;
+        }
+
+        channel.force(false);
+        syncCount.incrementAndGet();
+        return target;
     }
 
     /**
@@ -456,6 +519,11 @@ public final class Bitcask implements AutoCloseable {
      */
     private void rotate() throws IOException {
         forceActive();
+
+        // That fsync covered every record appended so far, wherever it lives.
+        // Saying so releases anyone waiting for durability without a second trip
+        // to the disk.
+        groupCommit.published(nextSeq - 1);
 
         // Only now, with the segment on the disk: a hint that reached the disk
         // first would, after a power failure, point at records that never made
@@ -791,9 +859,9 @@ public final class Bitcask implements AutoCloseable {
         long position = writePos;
 
         writeFully(record, position);
-        if (config.syncPolicy() == SyncPolicy.ALWAYS) {
-            forceActive();
-        }
+
+        // No fsync per copied record either. runMerge fsyncs the whole output
+        // once, before it deletes anything, which is the guarantee that matters.
 
         if (indexKey != null) {
             keyDir.put(indexKeyCopyOf(key), new KeyDirEntry(activeFileId, position, size, seq));
