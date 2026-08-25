@@ -303,7 +303,7 @@ does.
 | One open file descriptor per segment | The index points into every segment, so all stay open |
 | Compaction is manual — nothing schedules `merge()` | The application decides when to pay for it |
 | A merge takes the write lock once per record | A writer that never pauses can starve it — Phase 4 |
-| A segment is fsynced at rotation while the write lock is held | Small segments turn that into a write-latency problem — Phase 4 |
+| A segment is fsynced at rotation while the write lock is held | Deliberate. Measured, and the alternatives were worse — see [decisions](docs/decisions.md) |
 
 **Measured** at 178 bytes of index memory per key on a 64-bit JVM with 16-byte
 keys — about 1.7 GB for 10 million keys. That is the number to check before

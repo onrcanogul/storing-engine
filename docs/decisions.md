@@ -168,6 +168,30 @@ constantly at the segment size used in the benchmark. On a store with realistic
 segments that cover disappears, and 512 would then be holding the lock for a long
 time to buy 6%.
 
+### The fsync at rotation stays where it is
+
+Every measurement in the phase pointed at it: a writer's p99 is one rotation
+fsync, it is what starved compaction, and it is the only fsync the default
+`SyncPolicy.NEVER` pays at all.
+
+Removing it entirely — the ceiling measurement — is worth 13x throughput at small
+segments. Keeping the guarantee and moving the fsync to a background thread
+captures **2% of that**, while tripling the latency of ordinary writes.
+
+**Turned down:** relaxing the recovery rule so that damage is tolerated in the
+newest closed segment as well as the active one, which would have allowed the
+fsync to happen after the segment closed. Also turned down: creating the next
+segment under a temporary name and only publishing it once its predecessor is
+durable, which preserves the rule exactly at the cost of a second naming scheme
+and recovery logic to finish an interrupted rotation.
+
+Neither was built. Two percent does not buy an invariant.
+
+**What this taught:** an fsync is not work a thread performs, it is a wait for the
+device to confirm. Moving the call changes which thread waits, not how long the
+wait is — the serialisation is below the application, in the filesystem journal
+and the device. Hence the rule below.
+
 ---
 
 ## What the phases taught, in general
@@ -177,9 +201,26 @@ cache belongs to the kernel and outlives the process. Anything that depends on
 the *order* writes reach the disk needs a different kind of test — counting the
 calls, not killing the process.
 
-**The lock is rarely the thing to look at first.** Twice in one phase, a cost
-that looked like lock contention was somewhere else: once in the filesystem
+**The lock is rarely the thing to look at first.** Three times in one phase, a
+cost that looked like lock contention was somewhere else: twice in the filesystem
 journal, once in an fsync the lock happened to be wrapped around.
+
+**Moving an fsync never helps.** It is a wait for hardware, serialised beneath the
+application, so handing it to another thread only changes who waits. Two things
+help and nothing else does: not doing it, when what it protects is already
+protected some other way; and doing it less often, since the cost is per
+operation and not per byte. Every attempt in this phase that ignored that came
+back with the same result — a small gain and a much slower common case.
+
+**Measure the ceiling before optimising anything.** Delete the expensive thing
+outright, let the tests fail, and read the number: that is the most any amount of
+cleverness could win. Then patch in the cheapest wrong version of the real design
+and read that number too — it is what the cleverness would actually win. Only
+then build. Two measurements here cost an hour and saved building a feature that
+would have returned 2%.
+
+**A change not made is a result.** The rotation fsync entry above is the most
+valuable thing in this document, and no code came out of it.
 
 **A test written after the code proves nothing until it has been seen red.**
 Where that is impossible because the guarantee already holds, mutate the engine
